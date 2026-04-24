@@ -245,7 +245,7 @@ pub struct Message {
     /// Ordinal among siblings sharing the same `parent_message_id` within the
     /// same session. Starts at 0 and increments per recreate.
     #[serde(default)]
-    pub variant_index: i32,
+    pub variant_index: u32,
     /// True if this variant is currently on the active conversation path.
     /// Exactly one sibling per parent should be active.
     #[serde(default)]
@@ -335,9 +335,9 @@ pub struct VariantInfo {
     /// Variant's message ID (the sibling itself).
     pub message_id: Uuid,
     /// Ordinal of this variant among siblings.
-    pub variant_index: i32,
+    pub variant_index: u32,
     /// How many variants exist at this position (including this one).
-    pub total_variants: i32,
+    pub total_variants: u32,
     /// True iff this variant is currently on the active path.
     pub is_active: bool,
 }

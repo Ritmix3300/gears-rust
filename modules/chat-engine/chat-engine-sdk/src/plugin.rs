@@ -48,8 +48,13 @@ pub struct MessagePluginCtx {
 }
 
 /// Shared context attached to every plugin invocation.
+///
+/// `Debug` is implemented manually to redact `plugin_config` — it may contain
+/// secrets (API keys, webhook auth, credentials) that must never hit logs.
+/// Wrappers `SessionPluginCtx` / `MessagePluginCtx` derive `Debug` and
+/// transitively inherit this redaction.
 #[allow(clippy::module_name_repetitions)]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PluginCallContext {
     /// Correlation ID for this plugin invocation. Used for log correlation and
     /// distributed tracing; Chat Engine generates a fresh UUIDv4 per call (or
@@ -71,6 +76,66 @@ pub struct PluginCallContext {
     /// Capability values selected for this call (subset of those declared by
     /// the plugin via `Capability`).
     pub enabled_capabilities: Option<Vec<CapabilityValue>>,
+}
+
+impl std::fmt::Debug for PluginCallContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `plugin_config` is redacted because it can carry plugin secrets
+        // (API keys, webhook auth, credentials) that must never appear in logs.
+        // We still indicate presence/absence so observability is not lost.
+        let plugin_config_redacted: Option<&'static str> =
+            self.plugin_config.as_ref().map(|_| "<redacted>");
+        f.debug_struct("PluginCallContext")
+            .field("request_id", &self.request_id)
+            .field("tenant_id", &self.tenant_id)
+            .field("user_id", &self.user_id)
+            .field("plugin_instance_id", &self.plugin_instance_id)
+            .field("session_type_id", &self.session_type_id)
+            .field("plugin_config", &plugin_config_redacted)
+            .field("enabled_capabilities", &self.enabled_capabilities)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod plugin_call_context_debug_tests {
+    use super::{PluginCallContext, TenantId, UserId};
+    use uuid::Uuid;
+
+    #[test]
+    fn debug_redacts_plugin_config_when_present() {
+        let ctx = PluginCallContext {
+            request_id: Uuid::nil(),
+            tenant_id: TenantId::new("t"),
+            user_id: UserId::new("u"),
+            plugin_instance_id: "p".into(),
+            session_type_id: Uuid::nil(),
+            plugin_config: Some(serde_json::json!({"api_key": "super-secret-123"})),
+            enabled_capabilities: None,
+        };
+        let printed = format!("{ctx:?}");
+        assert!(printed.contains("<redacted>"), "got: {printed}");
+        assert!(
+            !printed.contains("super-secret-123"),
+            "secret leaked: {printed}"
+        );
+    }
+
+    #[test]
+    fn debug_prints_none_when_plugin_config_absent() {
+        let ctx = PluginCallContext {
+            request_id: Uuid::nil(),
+            tenant_id: TenantId::new("t"),
+            user_id: UserId::new("u"),
+            plugin_instance_id: "p".into(),
+            session_type_id: Uuid::nil(),
+            plugin_config: None,
+            enabled_capabilities: None,
+        };
+        let printed = format!("{ctx:?}");
+        assert!(printed.contains("plugin_config: None"), "got: {printed}");
+        assert!(!printed.contains("<redacted>"), "got: {printed}");
+    }
 }
 
 #[async_trait]
