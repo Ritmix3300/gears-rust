@@ -24,7 +24,7 @@ enum AppError {
 
 impl From<DatabaseError> for AppError {
     fn from(e: DatabaseError) -> Self {
-        AppError::Database(e)  // error chain preserved
+        AppError::Database(e) // error chain preserved
     }
 }
 
@@ -34,7 +34,7 @@ struct ParseError(String);
 
 impl From<String> for ParseError {
     fn from(s: String) -> Self {
-        ParseError(s.to_string())  // not From<XxxError>, not flagged
+        ParseError(s.to_string()) // not From<XxxError>, not flagged
     }
 }
 
@@ -70,6 +70,35 @@ impl From<DatabaseError> for ContextError {
         ContextError {
             source: e,
             context: "database layer".to_string(), // receiver is &str, not Error — not flagged
+        }
+    }
+}
+
+// Good - UFCS ToString::to_string on a non-Error value must not be flagged.
+#[derive(Debug)]
+struct KeyedError {
+    key: String,
+    source: DatabaseError,
+}
+
+impl fmt::Display for KeyedError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.key, self.source)
+    }
+}
+
+impl std::error::Error for KeyedError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+impl From<DatabaseError> for KeyedError {
+    fn from(e: DatabaseError) -> Self {
+        let label: &str = "db";
+        KeyedError {
+            key: ToString::to_string(label), // UFCS on &str — not flagged
+            source: e,
         }
     }
 }

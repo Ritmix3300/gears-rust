@@ -23,10 +23,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use modkit_security::AccessScope;
+use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use account_management_sdk::{ListChildrenQuery, ProvisionMetadataEntry, TenantPage, TenantUpdate};
+use account_management_sdk::UpdateTenantRequest;
+use modkit_odata::{ODataQuery, Page};
 
 use crate::domain::error::DomainError;
 use crate::domain::tenant::closure::ClosureRow;
@@ -54,27 +56,29 @@ use crate::domain::tenant::retention::{
 /// * `scope_with(<narrowed>)` → `deny_all()` (`WHERE false`) for reads
 ///   / mutations, and `ScopeError::Denied` for INSERTs.
 ///
-/// **Until `InTenantSubtree` lands** (cyberware-rust#1813), callers
-/// MUST pass [`AccessScope::allow_all`]. A narrowed scope silently
-/// zero-rows every read and turns every mutation into a no-op or hard
-/// deny — no useful authorization happens at this boundary today.
-/// Cross-tenant authorization is enforced one layer up by the PDP
-/// gate in the service layer; this is **single-layer enforcement**
-/// and is a pre-production gate (see crate-level `lib.rs` note).
+/// # Subtree clamp via `InTenantSubtree`
 ///
-/// # Future: subtree clamp via `InTenantSubtree`
+/// The [`InTenantSubtree`](modkit_security::ScopeFilter::in_tenant_subtree)
+/// predicate (cyberware-rust#1813) compiles to a JOIN on
+/// `tenant_closure`. AM-side, the trait does NOT itself wire that
+/// predicate — the entity declares `Scopable(no_tenant, no_resource,
+/// no_owner, no_type)` so the scope filter has no resolvable property
+/// to clamp on. Authorization on `tenants` is therefore enforced one
+/// layer up via:
 ///
-/// Subtree clamp on `tenants` reads will land via a dedicated
-/// `InTenantSubtree` predicate type (mirror of the existing
-/// `InGroupSubtree` stack) — scoped as a separate PR in this stack
-/// between the AM service PR and the Tenant Resolver Plugin PR.
-/// After that lands, AM declares the `tenant_hierarchy` capability
-/// and the PDP returns `InTenantSubtree(root=subject.tenant_id)`
-/// constraints which the secure builder compiles to a JOIN on
-/// `tenant_closure`. At that point the `scope` parameter starts
-/// carrying meaningful narrowing and the impl-side `scope_with`
-/// calls begin to apply auto-filter; this docstring will be updated
-/// to drop the "MUST pass `allow_all`" requirement.
+/// * the PDP gate at the service layer (which produces the
+///   `InTenantSubtree` constraint the caller embedded in its scope),
+/// * and the URL-bound tenant id the REST handler trusts after the
+///   `AuthN` layer verifies the caller is bound to it.
+///
+/// For background callers (retention reaper, integrity check, etc.)
+/// that operate as `actor=system`, [`AccessScope::allow_all`] is the
+/// correct posture and the trait calls forward it through to the
+/// storage layer unchanged. Caller-driven reads of paginated children
+/// (`list_children`) already engage `InTenantSubtree` through the
+/// closure-table JOIN built by the secure-ORM when the caller passes
+/// a narrowed scope; the `tenants` entity itself stays
+/// scope-property-less.
 #[async_trait]
 pub trait TenantRepo: Send + Sync {
     // ---- Read operations -----------------------------------------------
@@ -90,14 +94,69 @@ pub trait TenantRepo: Send + Sync {
         id: Uuid,
     ) -> Result<Option<TenantModel>, DomainError>;
 
-    /// Direct-children list. Excludes `Provisioning` rows at the query
-    /// layer. Pagination is `top` / `skip` per `listChildren`. Order is
-    /// stable (by `(created_at, id)`) so cursor re-reads are deterministic.
+    /// Batch sibling of [`Self::find_by_id`]: return every row whose id
+    /// is in `ids` and that is visible under the supplied `scope`. The
+    /// caller-supplied id slice is deduplicated by the implementation;
+    /// missing ids do not surface as errors. Order of the returned
+    /// vector is unspecified — callers that need a positional mapping
+    /// MUST build a `HashMap<Uuid, TenantModel>` from the result. Used
+    /// by listings that resolve cross-row metadata (e.g. the
+    /// conversion parent listing's live `child_tenant_name` lookup) so
+    /// they avoid an N+1 round-trip pattern.
+    ///
+    /// # Soft-delete semantics — DELIBERATE asymmetry vs. `find_by_id`
+    ///
+    /// `find_many` returns only live rows (`deleted_at IS NULL`);
+    /// `find_by_id` does not filter by deletion. This is intentional:
+    /// `find_by_id`
+    /// is consumed by paths that need to disambiguate `NotFound` from
+    /// `Found-but-Deleted` (e.g. integrity check, conversion approve's
+    /// status precondition), while `find_many` is consumed by cross-
+    /// row metadata listings where surfacing a deleted tenant's name
+    /// would leak post-deletion state across a barrier. Callers that
+    /// need both behaviours should consult the trait method whose
+    /// docstring matches their semantics — do not paper over the
+    /// difference at the call site.
+    ///
+    /// # Batch-size ceiling
+    ///
+    /// The implementation lowers `ids` into a single SQL `IN (...)`
+    /// clause, which costs one bind parameter per id. Postgres caps
+    /// prepared-statement parameters at 65535, so callers MUST cap the
+    /// caller-supplied slice well below that limit (`SQLite` is
+    /// effectively unbounded but pays the same per-id round-trip cost
+    /// at very large fan-outs). Today every caller bounds its slice
+    /// from a paginated upstream listing whose `$top` is small (under
+    /// the module-config `listing.max_top` ceiling enforced by
+    /// `paginate_odata`'s `LimitCfg`), so the ceiling is implicit;
+    /// new callers MUST keep this invariant.
+    async fn find_many(
+        &self,
+        scope: &AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<TenantModel>, DomainError>;
+
+    /// Direct-children list, paginated through `paginate_odata`.
+    /// `parent_id` is the path-scoped parent (always `AND`-ed with
+    /// `tenants.parent_id`); `query` carries `$filter`, `$orderby`,
+    /// `$top`, `$cursor` over the SDK-declared
+    /// [`account_management_sdk::TenantInfoFilterField`] surface.
+    ///
+    /// `Provisioning` rows are excluded at the query layer. When
+    /// `query.filter` does NOT reference the `status` column, the
+    /// implementation `AND`-s `status IN (Active, Suspended)` so soft-
+    /// deleted rows stay hidden by default — callers wanting them pass
+    /// `$filter=status eq 'deleted'` explicitly (string form matching
+    /// the [`account_management_sdk::TenantStatus`] serde rename).
+    ///
+    /// Ordering defaults to `created_at ASC` (the cursor tiebreaker)
+    /// when `$orderby` is absent, keeping cursor re-reads stable.
     async fn list_children(
         &self,
         scope: &AccessScope,
-        query: &ListChildrenQuery,
-    ) -> Result<TenantPage<TenantModel>, DomainError>;
+        parent_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<TenantModel>, DomainError>;
 
     // ---- Write operations ----------------------------------------------
 
@@ -117,20 +176,70 @@ pub trait TenantRepo: Send + Sync {
     ) -> Result<TenantModel, DomainError>;
 
     /// Saga step 3: flip the tenant from `Provisioning` to `Active`,
-    /// insert the supplied closure rows, and persist any provider-returned
-    /// metadata entries in one transaction.
+    /// insert the supplied closure rows, and persist the optional
+    /// plugin-private metadata blob in one transaction.
     ///
     /// The `closure_rows` slice MUST contain the self-row plus one row per
     /// strict ancestor along the `parent_id` chain (built by
     /// [`crate::domain::tenant::closure::build_activation_rows`]). Any
     /// other composition violates the coverage / self-row invariants.
+    ///
+    /// `idp_metadata` is the opaque blob returned by the `IdP` plugin
+    /// from [`account_management_sdk::IdpProvisionResult::metadata`]; AM
+    /// upserts it into `tenant_idp_metadata` and replays it on every
+    /// subsequent `IdP` call via [`Self::find_idp_metadata`] /
+    /// [`account_management_sdk::IdpTenantContext::metadata`]. `None`
+    /// means the plugin reported no per-tenant state.
     async fn activate_tenant(
         &self,
         scope: &AccessScope,
         tenant_id: Uuid,
         closure_rows: &[ClosureRow],
-        metadata_entries: &[ProvisionMetadataEntry],
+        idp_metadata: Option<&Value>,
     ) -> Result<TenantModel, DomainError>;
+
+    /// Load the plugin-private metadata blob AM persisted at
+    /// `activate_tenant` time. Returns `None` when no row exists for
+    /// `tenant_id` (plugin returned no state, or the tenant was
+    /// provisioned before this column existed) OR when the row's
+    /// `metadata` column is SQL NULL.
+    ///
+    /// AM does NOT interpret the JSON shape; the plugin owns it
+    /// end-to-end. Callers forward the value verbatim into
+    /// [`account_management_sdk::IdpTenantContext::metadata`] on every
+    /// subsequent `IdP` call for this tenant.
+    async fn find_idp_metadata(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<Option<Value>, DomainError>;
+
+    /// Upsert plugin-private metadata for `tenant_id` outside the
+    /// activation SERIALIZABLE TX so the row survives a
+    /// `finalize_provisioning` failure mid-saga. Called by the
+    /// create-child saga and platform-bootstrap saga immediately after
+    /// a successful `provision_tenant` so the provisioning reaper can
+    /// rebuild a `IdpDeprovisionTenantRequest` carrying the plugin's
+    /// per-tenant state even when no activation TX ever committed.
+    ///
+    /// `idp_metadata = None` is the documented "plugin owns no per-
+    /// tenant state" path — the upsert still writes a row with SQL
+    /// NULL so `find_idp_metadata` can later distinguish "never
+    /// called" from "called with no payload" (mirrors the in-TX
+    /// `activate_tenant` invariant).
+    ///
+    /// Implementations MUST upsert (`ON CONFLICT (tenant_id) DO
+    /// UPDATE`): the create-child saga calls this BEFORE
+    /// `activate_tenant`, and the activation path performs its own
+    /// idempotent metadata write inside the SERIALIZABLE TX. A bare
+    /// INSERT would crash on the unique-primary-key constraint when
+    /// activation re-runs against an already-persisted row.
+    async fn upsert_idp_metadata(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        idp_metadata: Option<&Value>,
+    ) -> Result<(), DomainError>;
 
     /// Saga / reaper compensation: delete a `Provisioning` row that
     /// never reached activation. Guards on `status = Provisioning` to
@@ -143,7 +252,7 @@ pub trait TenantRepo: Send + Sync {
     ///   filter on `claimed_by = worker_id` so a peer reaper that
     ///   re-claimed the row after a `RETENTION_CLAIM_TTL`-busting
     ///   `IdP` round-trip does not get its work erased by this worker.
-    /// * `None` — saga-compensation path (`create_child` after
+    /// * `None` — saga-compensation path (`create_tenant` after
     ///   `IdP` `CleanFailure` / `UnsupportedOperation`). The DELETE
     ///   MUST filter on `claimed_by IS NULL` so a reaper that already
     ///   claimed the row mid-IdP-call retains exclusive ownership of
@@ -151,7 +260,7 @@ pub trait TenantRepo: Send + Sync {
     ///
     /// Implementations MUST also fence on `terminal_failure_at IS
     /// NULL` so a peer that already classified the row as
-    /// `DeprovisionFailure::Terminal` and parked it for operator
+    /// `IdpDeprovisionFailure::Terminal` and parked it for operator
     /// action is not silently erased.
     ///
     /// On a fence-mismatch the implementation MUST return
@@ -165,16 +274,11 @@ pub trait TenantRepo: Send + Sync {
         expected_claimed_by: Option<Uuid>,
     ) -> Result<(), DomainError>;
 
-    /// Apply a mutable-fields-only patch.
-    ///
-    /// When `patch.status` is `Some(new)` the implementation MUST also
-    /// rewrite `tenant_closure.descendant_status` for every row where
-    /// `descendant_id = tenant_id` in the same transaction per DESIGN
-    /// §3.1 `Closure status denormalization invariant`.
+    /// Apply a mutable-fields-only patch (`name` only — status
+    /// transitions go through [`Self::set_status`]).
     ///
     /// # Status-transition guards
     ///
-    /// PATCH may only flip the row between `Active` and `Suspended`.
     /// The implementation MUST reject:
     ///
     /// * **Current row in `Deleted`** — already in the deletion
@@ -183,16 +287,6 @@ pub trait TenantRepo: Send + Sync {
     /// * **Current row in `Provisioning`** — saga step 3 hasn't
     ///   activated the tenant; mutable patches are not part of the
     ///   activation contract. Returns [`DomainError::Conflict`].
-    /// * **`patch.status = Deleted`** — would skip the
-    ///   `deleted_at` / `deletion_scheduled_at` stamps that
-    ///   `schedule_deletion` is responsible for, breaking the
-    ///   `Tenant` schema's tombstone contract. Returns
-    ///   [`DomainError::Conflict`] with a hint to use the soft-delete
-    ///   flow.
-    /// * **`patch.status = Provisioning`** — would flip an
-    ///   SDK-visible row back to invisible while its `tenant_closure`
-    ///   rows remain present, violating the provisioning-exclusion
-    ///   invariant. Returns [`DomainError::Conflict`].
     ///
     /// The current-row checks run after every SERIALIZABLE retry so
     /// a soft-delete committing between the original attempt and the
@@ -201,7 +295,34 @@ pub trait TenantRepo: Send + Sync {
         &self,
         scope: &AccessScope,
         tenant_id: Uuid,
-        patch: &TenantUpdate,
+        patch: &UpdateTenantRequest,
+    ) -> Result<TenantModel, DomainError>;
+
+    /// Flip the row between `Active` and `Suspended`. Rewrites
+    /// `tenant_closure.descendant_status` for every row where
+    /// `descendant_id = tenant_id` in the same SERIALIZABLE
+    /// transaction per DESIGN §3.1 *Closure status denormalization
+    /// invariant*.
+    ///
+    /// Same-to-same (`new_status == current.status`) is an idempotent
+    /// no-op: the implementation returns the current row without
+    /// emitting an UPDATE, leaving `updated_at` unchanged.
+    ///
+    /// The implementation MUST reject (under SERIALIZABLE retry):
+    ///
+    /// * **Current row in `Deleted`** — terminal lifecycle state.
+    ///   Returns [`DomainError::Conflict`].
+    /// * **Current row in `Provisioning`** — saga has not activated
+    ///   the tenant. Returns [`DomainError::Conflict`].
+    /// * **`new_status` is `Deleted` or `Provisioning`** — both are
+    ///   reachable only through the dedicated soft-delete /
+    ///   provisioning flows. Returns [`DomainError::Conflict`].
+    async fn set_status(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        new_status: TenantStatus,
+        now: OffsetDateTime,
     ) -> Result<TenantModel, DomainError>;
 
     /// Return the closure-input ancestor chain for a new child whose
@@ -244,7 +365,7 @@ pub trait TenantRepo: Send + Sync {
     /// older_than` AND atomically claim them for the calling worker.
     /// Used by the provisioning reaper; mirrors the
     /// `scan_retention_due` claim pattern so two replicas cannot
-    /// invoke `IdpTenantProvisionerClient::deprovision_tenant` for the
+    /// invoke `IdpPluginClient::deprovision_tenant` for the
     /// same row inside one `RETENTION_CLAIM_TTL` window.
     ///
     /// `now` is used to compute the stale-claim cutoff so a worker
@@ -275,8 +396,20 @@ pub trait TenantRepo: Send + Sync {
     ) -> Result<u64, DomainError>;
 
     /// Flip the tenant from its current SDK-visible state to
-    /// `Deleted`, stamp `deletion_scheduled_at = now`, and rewrite
+    /// `Deleted`, stamp `deleted_at = now` (which also starts the
+    /// retention timer — eligibility for hard-delete becomes
+    /// `deleted_at + retention_window`), and rewrite
     /// `tenant_closure.descendant_status` in the same transaction.
+    ///
+    /// **Idempotent.** Calling on a row that is already in `Deleted`
+    /// status returns the existing tombstone without re-stamping
+    /// `deleted_at` (the retention deadline is preserved) and without
+    /// re-running the closure rewrite. The contract is enforced under
+    /// SERIALIZABLE isolation so two racing DELETEs on the same
+    /// `Active` row both terminate with the tombstone — the loser's
+    /// retry observes the post-flip state and returns `Ok` instead of
+    /// `Conflict`. `Provisioning` rows are rejected with `Conflict`:
+    /// they are the reaper's responsibility, not soft-delete.
     async fn schedule_deletion(
         &self,
         scope: &AccessScope,
@@ -292,7 +425,7 @@ pub trait TenantRepo: Send + Sync {
     /// Without this gate, a row that is in fact deferred (e.g. parent
     /// with a live child, status drifted, claim lost) would still
     /// trigger cascade hooks and an irreversible
-    /// `IdpTenantProvisionerClient::deprovision_tenant` call before
+    /// `IdpPluginClient::deprovision_tenant` call before
     /// `hard_delete_one` returned its non-`Cleaned` outcome — leaving
     /// `IdP`-side state torn down while AM keeps the row.
     ///
@@ -301,12 +434,12 @@ pub trait TenantRepo: Send + Sync {
     /// preflight and `hard_delete_one`, but in well-formed
     /// deployments this is unreachable: `schedule_deletion` rejects
     /// soft-delete on parents with live children under SERIALIZABLE,
-    /// and `create_child` rejects under a `Deleted` parent. The race
+    /// and `create_tenant` rejects under a `Deleted` parent. The race
     /// is observable only from legacy/corrupt state. If it does fire,
     /// `hard_delete_one`'s in-tx defense-in-depth still rejects, and
     /// the retention pipeline retries on the next tick — by which
     /// point the `IdP` plugin maps a re-call to
-    /// `DeprovisionFailure::NotFound`, which the retention loop
+    /// `IdpDeprovisionFailure::NotFound`, which the retention loop
     /// classifies as success-equivalent and continues with the local
     /// teardown. (For the precise outcome label and the way the
     /// loop folds `NotFound` and `UnsupportedOperation` into the
@@ -314,8 +447,8 @@ pub trait TenantRepo: Send + Sync {
     /// state machine in `service/retention.rs`.)
     ///
     /// Implementations MUST verify:
-    /// * row exists, `status == Deleted`, `deletion_scheduled_at`
-    ///   stamped (else `NotEligible`);
+    /// * row exists, `status == Deleted`, `deleted_at` stamped (else
+    ///   `NotEligible`);
     /// * `claimed_by == Some(claimed_by)` (else `NotEligible` — claim
     ///   was lost between scan and finalize);
     /// * no row in `tenants` names `id` as parent (else
@@ -347,7 +480,7 @@ pub trait TenantRepo: Send + Sync {
 
     /// Stamp `terminal_failure_at = now` on a `Provisioning` row that
     /// the `IdP` plugin has classified as
-    /// [`account_management_sdk::DeprovisionFailure::Terminal`]. The
+    /// [`account_management_sdk::IdpDeprovisionFailure::Terminal`]. The
     /// SDK contract treats this as non-recoverable and operator-
     /// action-required; the marker keeps the row out of the
     /// `scan_stuck_provisioning` retry loop until an operator
@@ -373,7 +506,7 @@ pub trait TenantRepo: Send + Sync {
     /// Stamp `terminal_failure_at = now` on a `Deleted` row whose
     /// retention-pipeline cleanup the service classified as
     /// non-recoverable: a `HookError::Terminal` (or panicking) cascade
-    /// hook, or a `DeprovisionFailure::Terminal` from the `IdP`
+    /// hook, or a `IdpDeprovisionFailure::Terminal` from the `IdP`
     /// plugin during `hard_delete_batch`. Symmetric to
     /// [`Self::mark_provisioning_terminal_failure`] for the
     /// reaper-side `Provisioning` path; the marker keeps the row out

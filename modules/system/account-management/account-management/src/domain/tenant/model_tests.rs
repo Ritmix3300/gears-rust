@@ -1,4 +1,4 @@
-use account_management_sdk::TenantUpdate;
+use account_management_sdk::UpdateTenantRequest;
 
 use super::*;
 
@@ -64,7 +64,7 @@ fn internal_status_lowers_into_sdk_for_visible_variants() {
 #[test]
 fn internal_status_lowering_provisioning_returns_err() {
     // Service-level filter (`is_sdk_visible`) drops Provisioning rows
-    // before they reach lower_to_tenant_*. If a bug ever bypasses
+    // before they reach `lower_to_tenant` / `lower_to_tenant_page`. If a bug ever bypasses
     // that filter, the lowering returns `Err(ProvisioningNotPublic)`
     // and the caller maps it to `DomainError::Internal` (HTTP 500),
     // not a process panic. This test pins the post-fix `TryFrom`
@@ -76,74 +76,21 @@ fn internal_status_lowering_provisioning_returns_err() {
 
 #[test]
 fn empty_update_is_empty() {
-    assert!(TenantUpdate::default().is_empty());
-    assert!(
-        !TenantUpdate {
-            name: Some("x".into()),
-            ..Default::default()
-        }
-        .is_empty()
-    );
-    assert!(
-        !TenantUpdate {
-            status: Some(account_management_sdk::TenantStatus::Active),
-            ..Default::default()
-        }
-        .is_empty()
-    );
+    assert!(UpdateTenantRequest::default().is_empty());
+    assert!(!UpdateTenantRequest::new().with_name("x").is_empty());
 }
 
-#[test]
-fn status_transition_active_suspended_allowed() {
-    validate_status_transition(TenantStatus::Active, TenantStatus::Suspended)
-        .expect("active -> suspended ok");
-    validate_status_transition(TenantStatus::Suspended, TenantStatus::Active)
-        .expect("suspended -> active ok");
-}
+// `validate_status_transition` was removed together with the
+// PATCH-side status field. `Active` ↔ `Suspended` transitions go
+// through `TenantRepo::set_status` (exercised under SERIALIZABLE
+// retry in `repo_impl::updates::set_status`); the rejection rules for
+// `Deleted` / `Provisioning` are covered by service-level tests for
+// `suspend_tenant` / `unsuspend_tenant` and the integration tests for
+// the soft-delete flow.
 
-#[test]
-fn status_transition_same_to_same_is_idempotent_ok() {
-    // HTTP PATCH idempotency (option A): resending the current status
-    // is admitted as a no-op. The repo + service layers detect no-op
-    // and skip the DB write so `updated_at` is NOT bumped, giving
-    // true idempotency (PATCH N times = PATCH once).
-    validate_status_transition(TenantStatus::Active, TenantStatus::Active)
-        .expect("Active -> Active is an idempotent no-op");
-    validate_status_transition(TenantStatus::Suspended, TenantStatus::Suspended)
-        .expect("Suspended -> Suspended is an idempotent no-op");
-}
-
-#[test]
-fn status_transition_to_deleted_rejected() {
-    let err = validate_status_transition(TenantStatus::Active, TenantStatus::Deleted)
-        .expect_err("reject");
-    assert!(matches!(err, DomainError::Conflict { .. }));
-}
-
-#[test]
-fn status_transition_from_provisioning_rejected() {
-    let err = validate_status_transition(TenantStatus::Provisioning, TenantStatus::Active)
-        .expect_err("reject");
-    assert!(matches!(err, DomainError::Conflict { .. }));
-}
-
-#[test]
-fn status_transition_from_deleted_rejected() {
-    let err = validate_status_transition(TenantStatus::Deleted, TenantStatus::Active)
-        .expect_err("reject");
-    assert!(matches!(err, DomainError::Conflict { .. }));
-}
-
-#[test]
-fn name_length_validation_rejects_empty_and_oversized() {
-    assert!(validate_tenant_name("a").is_ok());
-    assert!(validate_tenant_name(&"x".repeat(255)).is_ok());
-    assert!(matches!(
-        validate_tenant_name("").expect_err("empty rejected"),
-        DomainError::Validation { .. }
-    ));
-    assert!(matches!(
-        validate_tenant_name(&"x".repeat(256)).expect_err("too long rejected"),
-        DomainError::Validation { .. }
-    ));
-}
+// `validate_tenant_name` was deleted in favour of
+// `domain::gts_validation::validate_tenant_name_via_gts` (the
+// resource-group `validate_metadata_via_gts` pattern). The schema-
+// driven path is exercised through service-level tests that wire a
+// `MockTypesRegistryClient` with the `gts.cf.core.am.tenant.v1~`
+// schema registered.

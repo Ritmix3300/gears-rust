@@ -1,63 +1,80 @@
 //! Account Management SDK — public contract surface.
 //!
-//! This crate re-exports the canonical-errors public surface that AM
-//! uses for inter-module Rust callers and for REST `Problem`
-//! conversion. After the AIP-193 migration, AM no longer carries an
-//! AM-specific public error enum; callers depend on
-//! [`modkit_canonical_errors::CanonicalError`] directly, surfaced here
-//! as [`AccountManagementError`] for backwards-readability with the
-//! `resource-group-sdk` / `tenant-resolver-sdk` naming pattern.
+//! This crate publishes the inter-module client trait
+//! ([`AccountManagementClient`]) and its data types. The public error
+//! envelope is [`AccountManagementError`] — a flat enum mirroring the
+//! AIP-193 categories AM raises; this SDK does **not** depend on
+//! `modkit-canonical-errors`. The impl crate
+//! (`cyberware-account-management`) owns the mapping between AM's
+//! internal `DomainError` vocabulary and [`AccountManagementError`]
+//! at this boundary, and the further lift to
+//! `modkit_canonical_errors::CanonicalError` at the REST boundary.
 //!
 //! External consumers — plugin authors, dashboards, integration tests,
 //! sibling modules calling AM via `ClientHub` — depend on **this**
-//! crate, never on the impl crate (`cyberware-account-management`), so impl-side
-//! churn (sea-orm migrations, axum wiring, tokio runtime) does not
-//! propagate as a contract break.
+//! crate, never on the impl crate, so impl-side churn (sea-orm
+//! migrations, axum wiring, tokio runtime) does not propagate as a
+//! contract break.
 //!
 //! # Mapping summary (AIP-193)
 //!
-//! Every AM domain failure converts to a canonical category at the
-//! impl-crate boundary (`cyberware-account-management::domain::error`). The
-//! resulting HTTP status codes follow Google AIP-193 verbatim:
+//! Every AM domain failure surfaces in one of the
+//! [`AccountManagementError`] variants below; the HTTP status column
+//! is the AIP-193 mapping the REST handler applies through the
+//! impl-side `account_management_error_to_canonical` lift.
 //!
-//! | AM domain shape | Canonical category | HTTP |
-//! |-----------------|-------------------|------|
-//! | `Validation` / `InvalidTenantType` / `RootTenantCannotDelete` / `RootTenantCannotConvert` | `InvalidArgument` | 400 |
-//! | `NotFound` / `MetadataSchemaNotRegistered` / `MetadataEntryNotFound` | `NotFound` | 404 |
-//! | `TenantHasChildren` / `TenantHasResources` / `TypeNotAllowed` / `TenantDepthExceeded` / `PendingExists` / `InvalidActorForTransition` / `AlreadyResolved` / `Conflict` | `FailedPrecondition` | 400 |
+//! | Variant | AIP-193 category | HTTP |
+//! |---------|-----------------|------|
+//! | `Validation` | `InvalidArgument` | 400 |
+//! | `NotFound` | `NotFound` | 404 |
+//! | `AlreadyExists` | `AlreadyExists` | 409 |
+//! | `FailedPrecondition` | `FailedPrecondition` | 400 |
+//! | `Aborted` | `Aborted` | 409 |
 //! | `CrossTenantDenied` | `PermissionDenied` | 403 |
-//! | `ServiceUnavailable` (generic infra outage / `IdP` plugin failure) | `ServiceUnavailable` | 503 |
-//! | `IdpUnavailable` (bootstrap retry-loop sentinel; same wire envelope as `ServiceUnavailable`) | `ServiceUnavailable` | 503 |
-//! | `UnsupportedOperation` (former `IdpUnsupportedOperation`) | `Unimplemented` | 501 |
 //! | `IntegrityCheckInProgress` | `ResourceExhausted` | 429 |
-//! | `Internal` + retry-exhausted serialization conflict (`Aborted`) + unique violation (`AlreadyExists`) + DB unavailability (`ServiceUnavailable`) | as listed | 500 / 409 / 409 / 503 |
+//! | `UnsupportedOperation` | `Unimplemented` | 501 |
+//! | `ServiceUnavailable` | `ServiceUnavailable` | 503 |
+//! | `Internal` | `Internal` | 500 |
 //!
-//! `ServiceUnavailable` carries `retry_after_seconds`; `Aborted` carries
-//! `reason = "SERIALIZATION_CONFLICT"` for retry-exhausted serializable
-//! conflicts; resource-scoped categories carry the GTS resource type
-//! `gts.cf.core.am.{tenant|tenant_metadata|conversion_request}.v1~`
-//! plus a `resource_name` set by the construction site. The strings
-//! live in [`gts`] as `pub const` so consumers (audit pipeline,
-//! sibling modules, integration tests) can match on them by typed
-//! reference instead of stringly-typed comparison.
+//! `ServiceUnavailable` carries `retry_after_seconds`; `Aborted`
+//! carries `reason = "SERIALIZATION_CONFLICT"` for retry-exhausted
+//! serializable conflicts; resource-scoped variants (`NotFound`,
+//! `FailedPrecondition`) carry the GTS resource type from [`gts`] —
+//! e.g. `gts.cf.core.am.{tenant|tenant_metadata|conversion_request}.v1~`.
+//! Those strings live in [`gts`] as `pub const` so consumers can
+//! match on them by typed reference instead of stringly-typed
+//! comparison.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+pub mod client;
+pub mod error;
 pub mod gts;
 pub mod idp;
+pub mod idp_user;
+pub mod metadata;
 pub mod tenant;
 
+pub use client::AccountManagementClient;
+pub use error::AccountManagementError;
 pub use gts::{
-    CONVERSION_REQUEST_RESOURCE_TYPE, TENANT_METADATA_RESOURCE_TYPE, TENANT_RESOURCE_TYPE,
+    CONVERSION_REQUEST_RESOURCE_TYPE, IdpPluginSpecV1, TENANT_METADATA_RESOURCE_TYPE,
+    TENANT_RESOURCE_TYPE, USER_RESOURCE_TYPE,
 };
 pub use idp::{
-    CheckAvailabilityFailure, DeprovisionFailure, DeprovisionRequest, IdpTenantProvisionerClient,
-    ProvisionFailure, ProvisionMetadataEntry, ProvisionRequest, ProvisionResult,
+    IdpDeprovisionFailure, IdpDeprovisionTenantRequest, IdpPluginClient, IdpProvisionFailure,
+    IdpProvisionResult, IdpProvisionTarget, IdpProvisionTenantRequest,
 };
-pub use modkit_canonical_errors::CanonicalError as AccountManagementError;
-pub use modkit_canonical_errors::{self, CanonicalError, Problem};
+pub use idp_user::{
+    IdpDeprovisionUserRequest, IdpListUsersRequest, IdpNewUser, IdpProvisionUserRequest,
+    IdpTenantContext, IdpUser, IdpUserOperationFailure, IdpUserPagination, IdpUserPaginationError,
+    ListUsersQuery,
+};
+pub use metadata::{
+    MetadataEntry, MetadataEntryFilterField, MetadataEntryQuery, UpsertMetadataRequest,
+};
 pub use tenant::{
-    CreateChildInput, ListChildrenQuery, ListChildrenQueryError, TenantId, TenantInfo, TenantPage,
-    TenantStatus, TenantUpdate,
+    CreateTenantRequest, Tenant, TenantId, TenantInfoFilterField, TenantInfoQuery, TenantStatus,
+    UpdateTenantRequest,
 };

@@ -70,15 +70,13 @@ pub fn filename_str(source_map: &SourceMap, span: Span) -> Option<String> {
 pub fn is_temp_path(path: &str) -> bool {
     // Primary check: compare against the actual system temp directory
     let temp_dir = std::env::temp_dir();
-    if let Some(temp_str) = temp_dir.to_str() {
-        if path.starts_with(temp_str) {
-            return true;
-        }
+    if let Some(temp_str) = temp_dir.to_str()
+        && path.starts_with(temp_str)
+    {
+        return true;
     }
     // Fallback patterns for known temp directory locations
-    path.contains("/tmp/")
-        || path.contains("/var/folders/")
-        || path.contains("\\Temp\\")
+    path.contains("/tmp/") || path.contains("/var/folders/") || path.contains("\\Temp\\")
 }
 
 /// Result of parsing a version suffix from a name like `FooClientV1` or `FooClient2`.
@@ -186,20 +184,18 @@ pub fn parse_version_suffix(name: &str) -> VersionParts<'_> {
 /// `dylint_testing::ui_test_examples()` compiles UI test files from temp dirs without
 /// passing `--crate-name`, so the crate name check alone doesn't work for UI tests.
 pub fn is_in_sdk_crate(cx: &rustc_lint::EarlyContext<'_>, span: Span) -> bool {
-    if let Some(crate_name) = cx.sess().opts.crate_name.as_deref() {
+    if let Some(crate_name) = cx.sess().opts.crate_name.as_deref()
         // Cargo normalizes dashes to underscores for `--crate-name`.
-        if crate_name.ends_with("-sdk") || crate_name.ends_with("_sdk") {
-            return true;
-        }
+        && (crate_name.ends_with("-sdk") || crate_name.ends_with("_sdk"))
+    {
+        return true;
     }
 
     let Some(file_path) = filename_str(cx.sess().source_map(), span) else {
         return false;
     };
 
-    file_path.contains("-sdk/")
-        || file_path.contains("-sdk\\")
-        || is_temp_path(&file_path)
+    file_path.contains("-sdk/") || file_path.contains("-sdk\\") || is_temp_path(&file_path)
 }
 
 /// Check if span is within libs/modkit-db/ - the internal sqlx wrapper library
@@ -528,15 +524,11 @@ fn get_path_str_from_session(source_map: &SourceMap, span: Span) -> Option<Strin
     let file_name = source_map.span_to_filename(span);
 
     match file_name {
-        FileName::Real(ref real_name) => {
-            if let Some(local) = real_name.local_path() {
-                return Some(local.to_string_lossy().to_string());
-            } else {
-                return None;
-            }
-        }
-        _ => return None,
-    };
+        FileName::Real(ref real_name) => real_name
+            .local_path()
+            .map(|local| local.to_string_lossy().to_string()),
+        _ => None,
+    }
 }
 
 /// Extract simulated directory path from a comment at the start of a file.
@@ -587,7 +579,7 @@ pub fn test_comment_annotations_match_stderr(
     lint_code: &str,
     comment_pattern: &str,
 ) {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
 
     let trigger_comment = format!("// Should trigger {} - {}", lint_code, comment_pattern);
@@ -626,16 +618,19 @@ pub fn test_comment_annotations_match_stderr(
         let rs_lines: Vec<&str> = rs_content.lines().collect();
 
         // Find all lines with "Should trigger" or "Should not trigger" comments
-        let mut should_trigger_lines = HashSet::new();
-        let mut should_not_trigger_lines = HashSet::new();
+        let mut should_trigger_lines = HashMap::new();
+        let mut should_not_trigger_lines = HashMap::new();
 
         for (idx, line) in rs_lines.iter().enumerate() {
+            let comment_line_num = idx + 1;
+            let expected_error_line_num = idx + 2;
+
             if line.contains(&trigger_comment) {
                 // The next line should have an error (idx + 1 is the next line, +1 again for 1-indexed)
-                should_trigger_lines.insert(idx + 2);
+                should_trigger_lines.insert(expected_error_line_num, comment_line_num);
             } else if line.contains(&not_trigger_comment) {
                 // The next line should NOT have an error
-                should_not_trigger_lines.insert(idx + 2);
+                should_not_trigger_lines.insert(expected_error_line_num, comment_line_num);
             }
         }
 
@@ -643,36 +638,37 @@ pub fn test_comment_annotations_match_stderr(
         let mut error_lines = HashSet::new();
         for line in stderr_content.lines() {
             // Look for lines like "  --> $DIR/file.rs:5:1"
-            if line.contains("-->") && line.contains(".rs:") {
-                if let Some(pos) = line.rfind(".rs:") {
-                    let rest = &line[pos + 4..];
-                    if let Some(colon_pos) = rest.find(':') {
-                        if let Ok(line_num) = rest[..colon_pos].parse::<usize>() {
-                            error_lines.insert(line_num);
-                        }
-                    }
+            if line.contains("-->")
+                && line.contains(".rs:")
+                && let Some(pos) = line.rfind(".rs:")
+            {
+                let rest = &line[pos + 4..];
+                if let Some(colon_pos) = rest.find(':')
+                    && let Ok(line_num) = rest[..colon_pos].parse::<usize>()
+                {
+                    error_lines.insert(line_num);
                 }
             }
         }
 
         // Validate that should_trigger_lines match error_lines
-        for line_num in &should_trigger_lines {
+        for (line_num, comment_line_num) in &should_trigger_lines {
             assert!(
                 error_lines.contains(line_num),
                 "In {:?}: Line {} has '{}' comment but no corresponding error in .stderr file",
                 rs_file.file_name().unwrap(),
-                line_num,
+                comment_line_num,
                 trigger_comment
             );
         }
 
         // Validate that should_not_trigger_lines do NOT appear in error_lines
-        for line_num in &should_not_trigger_lines {
+        for (line_num, comment_line_num) in &should_not_trigger_lines {
             assert!(
                 !error_lines.contains(line_num),
                 "In {:?}: Line {} has '{}' comment but has an error in .stderr file",
                 rs_file.file_name().unwrap(),
-                line_num,
+                comment_line_num,
                 not_trigger_comment
             );
         }
@@ -680,7 +676,7 @@ pub fn test_comment_annotations_match_stderr(
         // Also verify that all error_lines are marked with should_trigger comments
         for line_num in &error_lines {
             assert!(
-                should_trigger_lines.contains(line_num),
+                should_trigger_lines.contains_key(line_num),
                 "In {:?}: Line {} has an error in .stderr file but no '{}' comment",
                 rs_file.file_name().unwrap(),
                 line_num,

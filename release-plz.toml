@@ -85,16 +85,6 @@ changelog_update = false
 git_release_enable = false
 
 [[package]]
-name = "cyberware-modkit-errors"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
-name = "cyberware-modkit-errors-macro"
-changelog_update = false
-git_release_enable = false
-
-[[package]]
 name = "cyberware-modkit-macros"
 changelog_update = false
 git_release_enable = false
@@ -137,6 +127,16 @@ git_release_enable = false
 
 [[package]]
 name = "cyberware-modkit-utils"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
+name = "cyberware-modkit-gts"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
+name = "cyberware-modkit-gts-macro"
 changelog_update = false
 git_release_enable = false
 

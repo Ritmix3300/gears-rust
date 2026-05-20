@@ -11,6 +11,16 @@ use modkit_canonical_errors::{CanonicalError, Problem};
 
 use super::classify_db_err_to_domain;
 use crate::domain::error::DomainError;
+use crate::infra::sdk_error_mapping::account_management_error_to_canonical;
+
+/// Route a `DomainError` through the two-hop pipeline
+/// (`DomainError → AccountManagementError → CanonicalError`). The
+/// temporary `From<DomainError> for CanonicalError` bridge has been
+/// retired; tests that pin the wire-envelope shape must drive both
+/// hops explicitly.
+fn canonical_of(domain: DomainError) -> CanonicalError {
+    account_management_error_to_canonical(domain.into())
+}
 
 #[test]
 fn classify_serialization_conflict_yields_aborted() {
@@ -34,7 +44,7 @@ fn classify_serialization_conflict_canonical_status_409() {
     let db_err = DbErr::Exec(RuntimeErr::Internal(
         "error returned from database: error with SQLSTATE 40001".into(),
     ));
-    let canonical: CanonicalError = classify_db_err_to_domain(db_err).into();
+    let canonical = canonical_of(classify_db_err_to_domain(db_err));
     assert_eq!(canonical.status_code(), 409);
     let CanonicalError::Aborted { ctx, .. } = canonical else {
         panic!("expected Aborted");
@@ -52,9 +62,48 @@ fn classify_unique_violation_yields_already_exists() {
     ));
     let domain = classify_db_err_to_domain(db_err);
     assert!(matches!(domain, DomainError::AlreadyExists { .. }));
-    let canonical: CanonicalError = domain.into();
+    let canonical = canonical_of(domain);
     assert_eq!(canonical.status_code(), 409);
     assert!(matches!(canonical, CanonicalError::AlreadyExists { .. }));
+}
+
+#[test]
+fn classify_check_violation_yields_validation_400() {
+    use sea_orm::{DbErr, RuntimeErr};
+    // String-based detection of a Postgres CHECK violation surfaced
+    // through `RuntimeErr::Internal`. Without this classification the
+    // failure would fall to the unclassified arm → `Internal` (HTTP
+    // 500); the regression guard pins HTTP 400 + `Validation` so a
+    // degraded-mode short-circuit in `validate_tenant_name_via_gts`
+    // (schema not yet registered → `Ok(())`) still produces a
+    // client-actionable error when the DB-side CHECK fires.
+    let db_err = DbErr::Exec(RuntimeErr::Internal(
+        "new row for relation \"tenants\" violates check constraint \"ck_tenants_root_depth\""
+            .into(),
+    ));
+    let domain = classify_db_err_to_domain(db_err);
+    assert!(
+        matches!(domain, DomainError::Validation { .. }),
+        "CHECK constraint violations MUST map to Validation, got {domain:?}"
+    );
+    let canonical = canonical_of(domain);
+    assert_eq!(canonical.status_code(), 400);
+}
+
+#[test]
+fn classify_check_violation_sqlite_lowercased_message_yields_validation() {
+    use sea_orm::{DbErr, RuntimeErr};
+    // SQLite emits the constraint failure with different capitalisation
+    // ("CHECK constraint failed: …"); the lowercase substring search
+    // in `is_check_violation` MUST catch both. Pin the SQLite shape
+    // explicitly so a future refactor that swaps to typed
+    // `SqlErr::CheckConstraintViolation` detection without keeping the
+    // fallback does not regress on this engine.
+    let db_err = DbErr::Exec(RuntimeErr::Internal(
+        "CHECK constraint failed: ck_conversion_requests_actor_invariant".into(),
+    ));
+    let domain = classify_db_err_to_domain(db_err);
+    assert!(matches!(domain, DomainError::Validation { .. }));
 }
 
 #[test]
@@ -63,7 +112,7 @@ fn classify_availability_yields_service_unavailable() {
     let db_err = DbErr::ConnectionAcquire(ConnAcquireErr::Timeout);
     let domain = classify_db_err_to_domain(db_err);
     assert!(matches!(domain, DomainError::ServiceUnavailable { .. }));
-    let canonical: CanonicalError = domain.into();
+    let canonical = canonical_of(domain);
     assert_eq!(canonical.status_code(), 503);
 }
 
@@ -75,13 +124,13 @@ fn idp_unavailable_maps_to_503() {
     // generic variant. This regression guard pins two halves of the
     // contract: the HTTP status stays 503 AND the public `detail` is
     // **redacted** to a stable generic string (vendor / SDK / endpoint
-    // text from `ProvisionFailure::detail` is operator-meaningful but
+    // text from `IdpProvisionFailure::detail` is operator-meaningful but
     // not public-contract and would otherwise leak through the
     // Problem envelope — see `canonical_mapping::IdpUnavailable` arm).
     let domain = DomainError::IdpUnavailable {
         detail: "idp probe timed out (vendor=keycloak, host=internal.example)".to_owned(),
     };
-    let canonical: CanonicalError = domain.into();
+    let canonical = canonical_of(domain);
     assert_eq!(canonical.status_code(), 503);
     // Redaction contract: if the canonical mapping ever stops
     // redacting, vendor strings would surface in public Problem
@@ -102,7 +151,7 @@ fn classify_unclassified_yields_internal() {
     let db_err = DbErr::Custom("unclassified".into());
     let domain = classify_db_err_to_domain(db_err);
     assert!(matches!(domain, DomainError::Internal { .. }));
-    let canonical: CanonicalError = domain.into();
+    let canonical = canonical_of(domain);
     assert_eq!(canonical.status_code(), 500);
 }
 
@@ -125,7 +174,7 @@ fn dberror_io_routes_to_service_unavailable() {
     // arm fell through to `Internal` and lost the availability signal.
     let io_err = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "reset by peer");
     let lifted: DomainError = DbError::Io(io_err).into();
-    let canonical: CanonicalError = lifted.into();
+    let canonical = canonical_of(lifted);
     assert_eq!(canonical.status_code(), 503);
     assert!(matches!(
         canonical,
@@ -141,7 +190,7 @@ fn dberror_other_routes_to_internal_with_redacted_diagnostic() {
     // (no raw DSN / config text leaks).
     let lifted: DomainError =
         DbError::UnknownDsn("postgres://secret_user:secret_pass@host/db".into()).into();
-    let canonical: CanonicalError = lifted.into();
+    let canonical = canonical_of(lifted);
     assert_eq!(canonical.status_code(), 500);
     let CanonicalError::Internal { ctx, .. } = canonical else {
         panic!("expected Internal");
@@ -182,7 +231,7 @@ fn internal_diagnostic_is_not_serialized_into_canonical_envelope() {
         diagnostic: sentinel.to_owned(),
         cause: None,
     };
-    let canonical = CanonicalError::from(domain);
+    let canonical = canonical_of(domain);
     // The public HTTP boundary serializes through `Problem` (RFC 9457
     // envelope), not `CanonicalError` directly. Drive the conversion
     // and serde-encode the resulting envelope to mirror what a REST

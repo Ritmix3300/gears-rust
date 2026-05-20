@@ -5,12 +5,17 @@
 //! [`TenantRepo`] trait dispatches to a `pub(super)` free function in
 //! the matching submodule.
 
+pub mod conversion;
 mod helpers;
 mod integrity;
 mod lifecycle;
+pub mod metadata;
 mod reads;
 mod retention;
 mod updates;
+
+pub use conversion::ConversionRepoImpl;
+pub use metadata::MetadataRepoImpl;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,17 +23,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use modkit_db::DBProvider;
 use modkit_security::AccessScope;
+use serde_json::Value;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use account_management_sdk::ProvisionMetadataEntry;
-
-use account_management_sdk::{ListChildrenQuery, TenantPage, TenantUpdate};
+use account_management_sdk::UpdateTenantRequest;
+use modkit_odata::{ODataQuery, Page};
 
 use crate::domain::error::DomainError;
 use crate::domain::tenant::closure::ClosureRow;
 use crate::domain::tenant::integrity::{IntegrityCategory, Violation};
-use crate::domain::tenant::model::{ChildCountFilter, NewTenant, TenantModel};
+use crate::domain::tenant::model::{ChildCountFilter, NewTenant, TenantModel, TenantStatus};
 use crate::domain::tenant::repo::TenantRepo;
 use crate::domain::tenant::retention::{
     HardDeleteEligibility, HardDeleteOutcome, TenantProvisioningRow, TenantRetentionRow,
@@ -59,12 +64,21 @@ impl TenantRepo for TenantRepoImpl {
         reads::find_by_id(self, scope, id).await
     }
 
+    async fn find_many(
+        &self,
+        scope: &AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<TenantModel>, DomainError> {
+        reads::find_many(self, scope, ids).await
+    }
+
     async fn list_children(
         &self,
         scope: &AccessScope,
-        query: &ListChildrenQuery,
-    ) -> Result<TenantPage<TenantModel>, DomainError> {
-        reads::list_children(self, scope, query).await
+        parent_id: Uuid,
+        query: &ODataQuery,
+    ) -> Result<Page<TenantModel>, DomainError> {
+        reads::list_children(self, scope, parent_id, query).await
     }
 
     async fn insert_provisioning(
@@ -80,9 +94,26 @@ impl TenantRepo for TenantRepoImpl {
         scope: &AccessScope,
         tenant_id: Uuid,
         closure_rows: &[ClosureRow],
-        metadata_entries: &[ProvisionMetadataEntry],
+        idp_metadata: Option<&Value>,
     ) -> Result<TenantModel, DomainError> {
-        lifecycle::activate_tenant(self, scope, tenant_id, closure_rows, metadata_entries).await
+        lifecycle::activate_tenant(self, scope, tenant_id, closure_rows, idp_metadata).await
+    }
+
+    async fn find_idp_metadata(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+    ) -> Result<Option<Value>, DomainError> {
+        reads::find_idp_metadata(self, scope, tenant_id).await
+    }
+
+    async fn upsert_idp_metadata(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        idp_metadata: Option<&Value>,
+    ) -> Result<(), DomainError> {
+        lifecycle::upsert_idp_metadata(self, scope, tenant_id, idp_metadata).await
     }
 
     async fn compensate_provisioning(
@@ -98,9 +129,19 @@ impl TenantRepo for TenantRepoImpl {
         &self,
         scope: &AccessScope,
         tenant_id: Uuid,
-        patch: &TenantUpdate,
+        patch: &UpdateTenantRequest,
     ) -> Result<TenantModel, DomainError> {
         updates::update_tenant_mutable(self, scope, tenant_id, patch).await
+    }
+
+    async fn set_status(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        new_status: TenantStatus,
+        now: OffsetDateTime,
+    ) -> Result<TenantModel, DomainError> {
+        updates::set_status(self, scope, tenant_id, new_status, now).await
     }
 
     async fn load_ancestor_chain_through_parent(

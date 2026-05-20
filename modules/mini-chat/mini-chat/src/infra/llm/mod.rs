@@ -138,6 +138,11 @@ pub(crate) fn sanitize_provider_message(msg: &str) -> String {
     RE_CRED.replace_all(&sanitized, "[credential]").into_owned()
 }
 
+// TODO(DE1302): `LlmProviderError::ProviderError` carries `raw_detail` as a
+// `String`, so stringifying the gateway error is the intended fallback for the
+// catch-all arm. If the variant gains a structured source, wire it up and drop
+// this allow.
+#[allow(unknown_lints, de1302_error_from_to_string)]
 impl From<ServiceGatewayError> for LlmProviderError {
     fn from(err: ServiceGatewayError) -> Self {
         match err {
@@ -202,6 +207,15 @@ pub enum TerminalOutcome {
         reason: String,
         usage: Usage,
         partial_content: String,
+    },
+    /// Provider signalled a function tool call — agentic loop iteration.
+    ToolUse {
+        /// Provider-assigned call ID (used when replying with `function_call_output`).
+        tool_use_id: String,
+        /// Tool name (e.g. `"search_knowledge"`).
+        name: String,
+        /// Parsed arguments JSON (empty object if unparseable).
+        input: serde_json::Value,
     },
 }
 

@@ -141,6 +141,11 @@ setup: .setup-stamp
 	@if echo "$$OS" | grep -iq windows || [ -n "$$COMSPEC" ]; then \
 		echo "WARNING: kani-verifier and cargo-llvm-cov installation skipped on Windows."; \
 		echo "These tools are not supported on Windows. Use WSL2 or Docker to install instead."; \
+		if ! command -v nasm >/dev/null 2>&1; then \
+			echo "Installing NASM (required by aws-lc-sys on Windows)..."; \
+			winget install NASM.NASM --accept-source-agreements --accept-package-agreements || \
+				echo "WARNING: NASM auto-install failed. Install manually from https://www.nasm.us/"; \
+		fi; \
 	else \
 		cargo install --locked kani-verifier && \
 		cargo kani setup && \
@@ -156,7 +161,8 @@ setup: .setup-stamp
 # Check code formatting
 fmt:
 	$(call check_rustup_component,rustfmt)
-	cargo fmt --all -- --check
+	cargo fmt --all --check
+	cargo fmt --all --check --manifest-path tools/dylint_lints/Cargo.toml
 
 # -------- Module naming validation --------
 
@@ -292,18 +298,26 @@ safety: clippy kani lint dylint # geiger
 
 # -------- Code security checks --------
 
-.PHONY: deny security
+.PHONY: deny fips-policy security
 
 ## Check licenses and dependencies
 deny:
 	$(call check_tool,cargo-deny)
 	cargo deny check
 
-security: deny
+## FIPS dependency-graph policy (see deny-fips.toml + ADR 0005).
+## Refuses the build if any non-FIPS-validated crypto crate enters the
+## --features fips dep graph. Build-time analogue of Go 1.25 fips140=only.
+## Run on every PR that touches deps.
+fips-policy:
+	$(call check_tool,cargo-deny)
+	cargo deny check bans --config deny-fips.toml
+
+security: deny fips-policy
 
 # -------- API and docs --------
 
-.PHONY: openapi
+.PHONY: openapi md-fabric
 
 # Generate OpenAPI spec from running cyberware-example-server
 openapi:
@@ -316,6 +330,10 @@ openapi:
 	echo "Sorting OpenAPI JSON for deterministic ordering..." && \
 	python3 tools/scripts/sort_openapi_json.py "$(OPENAPI_OUT)" && \
 	echo "OpenAPI spec saved to $(OPENAPI_OUT)"
+
+## Generate Markdown files map
+md-fabric:
+	python3 ./tools/scripts/md-fabric.py --out docs/md-fabric/md-fabric.html
 
 # -------- Development and auto fix --------
 
@@ -332,6 +350,7 @@ dev-fmt:
 ## Auto-fix clippy warnings
 dev-clippy:
 	cargo clippy --workspace --all-targets --all-features --fix --allow-dirty
+	@cd tools/dylint_lints && cargo clippy --all-targets --workspace
 
 # Auto-fix formatting and clippy warnings
 dev: dev-fmt dev-clippy dev-test
@@ -374,6 +393,34 @@ test-users-info-pg: install-tools
 ## Run FIPS-mode integration tests (cyberware-modkit, requires Go for aws-lc-fips-sys)
 test-fips: install-tools
 	cargo nextest run -p cyberware-modkit --features bootstrap,fips
+
+## Cross-compile gate for the Windows+FIPS path (Windows handshake
+## verification is the manual runbook in cyberware-fips-probe/README.md). Catches
+## type / cfg / feature-graph regressions for `rustls-cng-crypto` and the
+## dep-graph (`rustls-cng-crypto` present, `aws-lc-fips-sys` absent).
+##
+## Uses `cargo-xwin` because the workspace pulls transitive C deps
+## (`aws-lc-sys`, `libz-ng-sys`) whose build.rs scripts need a Windows
+## sysroot (`windows.h`, MSVC headers). `cargo-xwin` downloads the MSVC
+## redistributable and CRT/Windows headers automatically — works on Linux,
+## macOS, and Windows hosts without a pre-installed Visual Studio.
+##
+## Prerequisites:
+##   cargo install cargo-xwin    # MSVC sysroot bridge
+##   # And a cmake build driver for the cmake-based transitive C deps:
+##   # macOS:  brew install ninja
+##   # Linux:  apt-get install ninja-build  (or: dnf install ninja-build)
+##
+## Pair this with the dep-graph regression check, which needs no toolchain
+## at all and runs on any host:
+##   cargo tree --target x86_64-pc-windows-msvc -p cyberware-example-server \
+##       --features fips -e features | grep aws-lc-fips    # must be empty
+.PHONY: check-windows-fips
+check-windows-fips:
+	$(call check_tool,cargo-xwin)
+	$(call check_tool,ninja)
+	rustup target add x86_64-pc-windows-msvc
+	cargo xwin check --target x86_64-pc-windows-msvc -p cyberware-example-server --features fips
 
 # -------- Benchmarks --------
 

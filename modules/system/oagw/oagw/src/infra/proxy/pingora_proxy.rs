@@ -21,8 +21,11 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::model::{Endpoint, Scheme};
-use crate::domain::services::{EndpointSelector, SelectedEndpoint};
+use crate::domain::services::{EndpointSelector, SelectedEndpoint, SelectionError};
+use crate::domain::ssrf::SsrfGuard;
 use modkit_canonical_errors::Problem;
+
+use crate::api::rest::error::domain_error_to_problem;
 
 // ---------------------------------------------------------------------------
 // Internal header names (D9)
@@ -134,6 +137,8 @@ pub struct PingoraProxy {
     skip_upstream_tls_verify: bool,
     /// Per-host cache of ALPN-negotiated protocol versions.
     protocol_cache: ProtocolVersionCache,
+    /// Pre-compiled SSRF guard for IP filtering.
+    ssrf_guard: Arc<SsrfGuard>,
 }
 
 impl PingoraProxy {
@@ -141,12 +146,14 @@ impl PingoraProxy {
         connect_timeout: Duration,
         read_timeout: Duration,
         protocol_cache_ttl: Duration,
+        ssrf_guard: Arc<SsrfGuard>,
     ) -> Self {
         Self {
             connect_timeout,
             read_timeout,
             skip_upstream_tls_verify: false,
             protocol_cache: ProtocolVersionCache::new(protocol_cache_ttl),
+            ssrf_guard,
         }
     }
 
@@ -234,13 +241,16 @@ struct DnsDiscovery {
     endpoints: Vec<Endpoint>,
     /// Shared map updated on each `discover()` cycle.
     addr_map: AddrMap,
+    /// Pre-compiled SSRF guard for IP filtering.
+    ssrf_guard: Arc<SsrfGuard>,
 }
 
 impl DnsDiscovery {
-    fn new(endpoints: Vec<Endpoint>, addr_map: AddrMap) -> Box<Self> {
+    fn new(endpoints: Vec<Endpoint>, addr_map: AddrMap, ssrf_guard: Arc<SsrfGuard>) -> Box<Self> {
         Box::new(Self {
             endpoints,
             addr_map,
+            ssrf_guard,
         })
     }
 
@@ -260,6 +270,15 @@ impl DnsDiscovery {
             match resolved {
                 Ok(addrs) => {
                     for sock in addrs {
+                        if self.ssrf_guard.is_ip_blocked(sock.ip()) {
+                            warn!(
+                                addr = %addr_str,
+                                resolved_ip = %sock.ip(),
+                                reason = self.ssrf_guard.ip_block_reason(sock.ip()),
+                                "SSRF protection: blocked DNS-resolved private IP"
+                            );
+                            continue;
+                        }
                         let key = sock.to_string();
                         if let Ok(b) = Backend::new(&key) {
                             backends.insert(b);
@@ -270,6 +289,18 @@ impl DnsDiscovery {
                 }
                 Err(e) => {
                     warn!(addr = %addr_str, error = %e, "DNS resolution failed after retries, using original address");
+                    // Apply the same SSRF filter to the fallback path: if the
+                    // original address is a raw IP, it must pass the blocklist.
+                    if let Ok(ip) = ep.host.parse::<std::net::IpAddr>()
+                        && self.ssrf_guard.is_ip_blocked(ip)
+                    {
+                        warn!(
+                            addr = %addr_str,
+                            reason = self.ssrf_guard.ip_block_reason(ip),
+                            "SSRF protection: blocked private IP in DNS fallback"
+                        );
+                        continue;
+                    }
                     if let Ok(b) = Backend::new(&addr_str) {
                         backends.insert(b);
                         map.entry(addr_str).or_insert_with(|| ep.clone());
@@ -318,12 +349,37 @@ struct LbEntry {
 /// background task.
 pub struct PingoraEndpointSelector {
     cache: DashMap<Uuid, LbEntry>,
+    /// Pre-compiled SSRF guard for IP filtering.
+    ssrf_guard: Arc<SsrfGuard>,
 }
 
 impl PingoraEndpointSelector {
-    pub fn new() -> Self {
+    pub fn new(ssrf_guard: Arc<SsrfGuard>) -> Self {
         Self {
             cache: DashMap::new(),
+            ssrf_guard,
+        }
+    }
+
+    /// Select from an existing LB entry, returning a typed error when
+    /// no backend can be chosen.
+    fn select_from_entry(entry: &LbEntry) -> Result<SelectedEndpoint, SelectionError> {
+        if let Some(backend) = entry.lb.select(b"", 256) {
+            let resolved_addr = backend.addr.as_inet();
+            let addr_key = backend.addr.to_string();
+            let map = entry.addr_map.load();
+            if let Some(endpoint) = map.get(&addr_key).cloned() {
+                return Ok(SelectedEndpoint {
+                    endpoint,
+                    resolved_addr: resolved_addr.copied(),
+                });
+            }
+        }
+        // No usable backend — classify the failure.
+        if entry.addr_map.load().is_empty() {
+            Err(SelectionError::NoBackendsResolved)
+        } else {
+            Err(SelectionError::AllBackendsUnhealthy)
         }
     }
 
@@ -332,10 +388,15 @@ impl PingoraEndpointSelector {
     ///
     /// DNS resolution uses async `tokio::net::lookup_host` to avoid blocking
     /// the Tokio worker thread.
-    async fn build_entry(&self, endpoints: &[Endpoint]) -> Option<LbEntry> {
+    async fn build_entry(&self, endpoints: &[Endpoint]) -> Result<LbEntry, SelectionError> {
         let addr_map: AddrMap = Arc::new(ArcSwap::from_pointee(HashMap::new()));
 
-        let mut backends = Backends::new(DnsDiscovery::new(endpoints.to_vec(), addr_map.clone()));
+        let discovery = DnsDiscovery::new(
+            endpoints.to_vec(),
+            addr_map.clone(),
+            self.ssrf_guard.clone(),
+        );
+        let mut backends = Backends::new(discovery);
         backends.set_health_check(TcpHealthCheck::new());
 
         let mut lb = LoadBalancer::<RoundRobin>::from_backends(backends);
@@ -344,11 +405,14 @@ impl PingoraEndpointSelector {
 
         // update() calls discover() which resolves DNS and populates both
         // the backend selector and the addr_map in a single pass.
-        lb.update().await.ok()?;
+        if let Err(e) = lb.update().await {
+            warn!(error = %e, "LB update failed");
+            return Err(SelectionError::NoBackendsResolved);
+        }
 
         if addr_map.load().is_empty() {
             warn!("No backends resolved for endpoints, skipping LB creation");
-            return None;
+            return Err(SelectionError::NoBackendsResolved);
         }
 
         let lb = Arc::new(lb);
@@ -364,7 +428,7 @@ impl PingoraEndpointSelector {
             lb_bg.start(shutdown_rx).await;
         });
 
-        Some(LbEntry {
+        Ok(LbEntry {
             lb,
             addr_map,
             _shutdown_tx: shutdown_tx,
@@ -374,18 +438,14 @@ impl PingoraEndpointSelector {
 
 #[async_trait]
 impl EndpointSelector for PingoraEndpointSelector {
-    async fn select(&self, upstream_id: Uuid, endpoints: &[Endpoint]) -> Option<SelectedEndpoint> {
+    async fn select(
+        &self,
+        upstream_id: Uuid,
+        endpoints: &[Endpoint],
+    ) -> Result<SelectedEndpoint, SelectionError> {
         // Fast path: LB already cached.
         if let Some(entry) = self.cache.get(&upstream_id) {
-            let backend = entry.lb.select(b"", 256)?;
-            let resolved_addr = backend.addr.as_inet();
-            let addr_key = backend.addr.to_string();
-            let map = entry.addr_map.load();
-            let endpoint = map.get(&addr_key)?.clone();
-            return Some(SelectedEndpoint {
-                endpoint,
-                resolved_addr: resolved_addr.copied(),
-            });
+            return Self::select_from_entry(&entry);
         }
 
         // Slow path: build a new LB entry then atomically insert-if-absent.
@@ -393,15 +453,7 @@ impl EndpointSelector for PingoraEndpointSelector {
         // and losers are dropped (stopping their background task via _shutdown_tx).
         let entry = self.build_entry(endpoints).await?;
         let entry_ref = self.cache.entry(upstream_id).or_insert(entry);
-        let backend = entry_ref.lb.select(b"", 256)?;
-        let resolved_addr = backend.addr.as_inet();
-        let addr_key = backend.addr.to_string();
-        let map = entry_ref.addr_map.load();
-        let endpoint = map.get(&addr_key)?.clone();
-        Some(SelectedEndpoint {
-            endpoint,
-            resolved_addr: resolved_addr.copied(),
-        })
+        Self::select_from_entry(&entry_ref)
     }
 
     fn invalidate(&self, upstream_id: Uuid) {
@@ -527,6 +579,7 @@ impl ProxyHttp for PingoraProxy {
         let tls = matches!(ep.scheme, Scheme::Https | Scheme::Wss | Scheme::Wt);
 
         let addr = match ctx.resolved_addr {
+            // Already SSRF-filtered by DnsDiscovery::resolve() before entering addr_map.
             Some(a) => a,
             None => {
                 // Fallback: resolve DNS explicitly (single-endpoint bypass, target-host header).
@@ -541,12 +594,34 @@ impl ProxyHttp for PingoraProxy {
                             e,
                         )
                     })?;
-                addrs.into_iter().next()
+                // Filter resolved IPs through the SSRF guard.
+                let filtered: Vec<_> = addrs
+                    .into_iter()
+                    .filter(|sock| {
+                        if self.ssrf_guard.is_ip_blocked(sock.ip()) {
+                            warn!(
+                                upstream_id = ?ctx.upstream_id,
+                                host = %ep.host,
+                                resolved_ip = %sock.ip(),
+                                reason = self.ssrf_guard.ip_block_reason(sock.ip()),
+                                "SSRF protection: blocked DNS-resolved private IP in upstream_peer"
+                            );
+                            false
+                        } else {
+                            true
+                        }
+                    })
+                    .collect();
+                filtered.into_iter().next()
                     .ok_or_else(|| {
-                        warn!(upstream_id = ?ctx.upstream_id, host = %ep.host, port = ep.port, "DNS returned no addresses");
+                        let detail = format!(
+                            "DNS returned no usable addresses for {}:{}",
+                            ep.host, ep.port
+                        );
+                        warn!(upstream_id = ?ctx.upstream_id, host = %ep.host, port = ep.port, "{detail}");
                         pingora_core::Error::explain(
                             pingora_core::ErrorType::ConnectError,
-                            format!("DNS returned no addresses for {}:{}", ep.host, ep.port),
+                            detail,
                         )
                     })?
             }
@@ -697,6 +772,7 @@ impl ProxyHttp for PingoraProxy {
         ctx: &mut Self::CTX,
     ) -> pingora_proxy::FailToProxy {
         let instance = ctx.instance_uri.clone();
+        let instance_for_problem = instance.clone();
         let domain_err = match &e.etype {
             pingora_core::ErrorType::ConnectTimedout => DomainError::ConnectionTimeout {
                 detail: "upstream connection timed out".into(),
@@ -769,7 +845,10 @@ impl ProxyHttp for PingoraProxy {
             },
         };
 
-        let problem: Problem = domain_err.into();
+        // Pingora's response path is outside the axum router stack, so the
+        // canonical error middleware does not reach it. Pre-populate
+        // `instance` here so the wire body still carries the request URI.
+        let problem: Problem = domain_error_to_problem(domain_err, &instance_for_problem);
         let status = problem.status;
         let body_bytes = Bytes::from(serde_json::to_vec(&problem).unwrap_or_default());
 
@@ -848,13 +927,17 @@ mod tests {
         }
     }
 
+    fn ssrf_off() -> Arc<SsrfGuard> {
+        Arc::new(SsrfGuard::disabled())
+    }
+
     // Note: PingoraBackendSelector uses Pingora's LoadBalancer which resolves
     // addresses via ToSocketAddrs during construction. Tests must use real IP
     // addresses (e.g. 127.0.0.1) with distinct ports to differentiate endpoints.
 
     #[tokio::test]
     async fn select_round_robin_distribution() {
-        let selector = PingoraEndpointSelector::new();
+        let selector = PingoraEndpointSelector::new(ssrf_off());
         let id = Uuid::new_v4();
         let endpoints = vec![
             ep("127.0.0.1", 10001, Scheme::Https),
@@ -877,7 +960,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalidate_causes_rebuild() {
-        let selector = PingoraEndpointSelector::new();
+        let selector = PingoraEndpointSelector::new(ssrf_off());
         let id = Uuid::new_v4();
 
         let v1 = vec![ep("127.0.0.1", 20001, Scheme::Https)];
@@ -893,7 +976,7 @@ mod tests {
 
     #[tokio::test]
     async fn select_single_endpoint() {
-        let selector = PingoraEndpointSelector::new();
+        let selector = PingoraEndpointSelector::new(ssrf_off());
         let id = Uuid::new_v4();
         let endpoints = vec![ep("127.0.0.1", 30001, Scheme::Http)];
 
@@ -907,7 +990,7 @@ mod tests {
     /// Verify the scheme survives the Pingora Backend round-trip.
     #[tokio::test]
     async fn select_preserves_scheme() {
-        let selector = PingoraEndpointSelector::new();
+        let selector = PingoraEndpointSelector::new(ssrf_off());
         let id = Uuid::new_v4();
         // All endpoints share the same scheme (upstream-level invariant).
         // Use different ports to distinguish endpoints.
@@ -947,14 +1030,14 @@ mod tests {
     /// must match the resolved key in endpoints_by_addr.
     #[tokio::test]
     async fn select_resolves_hostname_for_reverse_lookup() {
-        let selector = PingoraEndpointSelector::new();
+        let selector = PingoraEndpointSelector::new(ssrf_off());
         let id = Uuid::new_v4();
         // Use "localhost" — a hostname that resolves to 127.0.0.1.
         let endpoints = vec![ep("localhost", 50001, Scheme::Https)];
 
         let selected = selector.select(id, &endpoints).await;
         assert!(
-            selected.is_some(),
+            selected.is_ok(),
             "select should succeed for hostname-based endpoint"
         );
         let selected = selected.unwrap();
@@ -979,7 +1062,7 @@ mod tests {
             ep("127.0.0.1", 8001, Scheme::Https),
             ep("127.0.0.1", 8002, Scheme::Https),
         ];
-        let discovery = DnsDiscovery::new(endpoints, addr_map);
+        let discovery = DnsDiscovery::new(endpoints, addr_map, ssrf_off());
 
         let (backends, map) = discovery.resolve().await;
 
@@ -996,7 +1079,7 @@ mod tests {
     async fn dns_discovery_resolve_hostname_endpoints() {
         let addr_map = make_addr_map();
         let endpoints = vec![ep("localhost", 9001, Scheme::Https)];
-        let discovery = DnsDiscovery::new(endpoints, addr_map);
+        let discovery = DnsDiscovery::new(endpoints, addr_map, ssrf_off());
 
         let (backends, map) = discovery.resolve().await;
 
@@ -1017,7 +1100,7 @@ mod tests {
             ep("127.0.0.1", 7001, Scheme::Https),
             ep("127.0.0.1", 7002, Scheme::Https),
         ];
-        let discovery = DnsDiscovery::new(endpoints, addr_map.clone());
+        let discovery = DnsDiscovery::new(endpoints, addr_map.clone(), ssrf_off());
 
         let (backends, _health) = discovery.discover().await.unwrap();
 
@@ -1038,7 +1121,7 @@ mod tests {
     async fn dns_discovery_discover_replaces_addr_map() {
         let addr_map = make_addr_map();
         let endpoints = vec![ep("127.0.0.1", 6001, Scheme::Http)];
-        let discovery = DnsDiscovery::new(endpoints, addr_map.clone());
+        let discovery = DnsDiscovery::new(endpoints, addr_map.clone(), ssrf_off());
 
         // First discover.
         discovery.discover().await.unwrap();
@@ -1069,7 +1152,7 @@ mod tests {
             443,
             Scheme::Https,
         )];
-        let discovery = DnsDiscovery::new(endpoints, addr_map);
+        let discovery = DnsDiscovery::new(endpoints, addr_map, ssrf_off());
 
         let (backends, map) = discovery.resolve().await;
 
@@ -1082,32 +1165,32 @@ mod tests {
         );
     }
 
-    /// select() returns None when the endpoint list is empty.
+    /// select() returns Err when the endpoint list is empty.
     #[tokio::test]
-    async fn select_empty_endpoints_returns_none() {
-        let selector = PingoraEndpointSelector::new();
+    async fn select_empty_endpoints_returns_err() {
+        let selector = PingoraEndpointSelector::new(ssrf_off());
         let id = Uuid::new_v4();
 
         let result = selector.select(id, &[]).await;
-        assert!(result.is_none(), "empty endpoints should return None");
+        assert!(result.is_err(), "empty endpoints should return Err");
         assert!(
             !selector.cache.contains_key(&id),
             "no cache entry should be created"
         );
     }
 
-    /// select() returns None when all endpoints fail DNS resolution
-    /// (build_entry returns None because addr_map stays empty).
+    /// select() returns Err(NoBackendsResolved) when all endpoints fail DNS.
     #[tokio::test]
-    async fn select_unresolvable_endpoints_returns_none() {
-        let selector = PingoraEndpointSelector::new();
+    async fn select_unresolvable_endpoints_returns_err() {
+        let selector = PingoraEndpointSelector::new(ssrf_off());
         let id = Uuid::new_v4();
 
         let endpoints = vec![ep("this.host.does.not.exist.invalid", 443, Scheme::Https)];
         let result = selector.select(id, &endpoints).await;
+        assert!(result.is_err(), "unresolvable endpoints should return Err");
         assert!(
-            result.is_none(),
-            "unresolvable endpoints should return None"
+            matches!(result.unwrap_err(), SelectionError::NoBackendsResolved),
+            "should be NoBackendsResolved"
         );
     }
 
@@ -1115,7 +1198,7 @@ mod tests {
     /// addr_map reflects the updated endpoints (simulates config change).
     #[tokio::test]
     async fn invalidate_rebuilds_with_new_addr_map() {
-        let selector = PingoraEndpointSelector::new();
+        let selector = PingoraEndpointSelector::new(ssrf_off());
         let id = Uuid::new_v4();
 
         // Initial endpoints.
@@ -1167,6 +1250,7 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(30),
             Duration::from_secs(3600),
+            ssrf_off(),
         );
         let ep = ep(host, port, scheme);
         let tls = matches!(ep.scheme, Scheme::Https | Scheme::Wss | Scheme::Wt);
@@ -1226,6 +1310,7 @@ mod tests {
             Duration::from_secs(7),
             Duration::from_secs(15),
             Duration::from_secs(3600),
+            ssrf_off(),
         );
         // Verify timeouts are stored correctly on the proxy.
         assert_eq!(proxy.connect_timeout, Duration::from_secs(7));
@@ -1282,7 +1367,7 @@ mod tests {
 
     #[tokio::test]
     async fn select_populates_resolved_addr() {
-        let selector = PingoraEndpointSelector::new();
+        let selector = PingoraEndpointSelector::new(ssrf_off());
         let id = Uuid::new_v4();
         // IP-based endpoint — resolved_addr should be populated.
         let endpoints = vec![ep("127.0.0.1", 30001, Scheme::Http)];
@@ -1394,6 +1479,7 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(30),
             Duration::from_secs(3600),
+            ssrf_off(),
         );
         let endpoint = ep("example.com", 443, Scheme::Https);
         proxy
@@ -1411,6 +1497,7 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(30),
             Duration::from_secs(3600),
+            ssrf_off(),
         );
         let endpoint = ep("example.com", 443, Scheme::Https);
         proxy
@@ -1428,6 +1515,7 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(30),
             Duration::from_secs(3600),
+            ssrf_off(),
         );
         let endpoint = ep("example.com", 443, Scheme::Https);
         assert_eq!(
@@ -1442,6 +1530,7 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(30),
             Duration::from_secs(3600),
+            ssrf_off(),
         );
         let endpoint = ep("example.com", 443, Scheme::Wss);
         // Even if someone were to insert an entry for this host, WSS must use H1.
@@ -1460,6 +1549,7 @@ mod tests {
             Duration::from_secs(10),
             Duration::from_secs(30),
             Duration::ZERO, // disabled
+            ssrf_off(),
         );
         let endpoint = ep("example.com", 443, Scheme::Https);
         // Insert would be a no-op, but call it anyway to verify.
@@ -1471,5 +1561,82 @@ mod tests {
             pingora_core::protocols::tls::ALPN::H2H1,
             "disabled cache should fall through to H2H1"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // SSRF protection tests — DnsDiscovery
+    // -----------------------------------------------------------------------
+
+    /// With ssrf_protection=true, loopback IPs are filtered from resolve results.
+    #[tokio::test]
+    async fn dns_discovery_ssrf_blocks_loopback() {
+        let addr_map = make_addr_map();
+        let endpoints = vec![ep("127.0.0.1", 8080, Scheme::Https)];
+        let ssrf_guard = Arc::new(SsrfGuard::from_config(&Default::default()).unwrap());
+        let discovery = DnsDiscovery::new(endpoints, addr_map, ssrf_guard);
+
+        let (backends, map) = discovery.resolve().await;
+
+        assert!(backends.is_empty(), "loopback should be blocked by SSRF");
+        assert!(map.is_empty(), "no map entries for blocked IPs");
+    }
+
+    /// With ssrf disabled, loopback IPs pass through.
+    #[tokio::test]
+    async fn dns_discovery_ssrf_off_allows_loopback() {
+        let addr_map = make_addr_map();
+        let endpoints = vec![ep("127.0.0.1", 8080, Scheme::Https)];
+        let ssrf_guard = Arc::new(SsrfGuard::disabled());
+        let discovery = DnsDiscovery::new(endpoints, addr_map, ssrf_guard);
+
+        let (backends, map) = discovery.resolve().await;
+
+        assert!(!backends.is_empty(), "loopback allowed when SSRF off");
+        assert!(!map.is_empty());
+    }
+
+    /// With ssrf enabled, localhost (resolves to 127.0.0.1) is blocked.
+    #[tokio::test]
+    async fn dns_discovery_ssrf_blocks_localhost_hostname() {
+        let addr_map = make_addr_map();
+        let endpoints = vec![ep("localhost", 9999, Scheme::Https)];
+        let ssrf_guard = Arc::new(SsrfGuard::from_config(&Default::default()).unwrap());
+        let discovery = DnsDiscovery::new(endpoints, addr_map, ssrf_guard);
+
+        let (backends, map) = discovery.resolve().await;
+
+        assert!(
+            backends.is_empty(),
+            "localhost resolves to 127.0.0.1 which should be blocked"
+        );
+        assert!(map.is_empty());
+    }
+
+    /// With ssrf_protection=true, selector returns Err(NoBackendsResolved) for loopback.
+    #[tokio::test]
+    async fn selector_ssrf_blocks_loopback() {
+        let ssrf_guard = Arc::new(SsrfGuard::from_config(&Default::default()).unwrap());
+        let selector = PingoraEndpointSelector::new(ssrf_guard);
+        let id = Uuid::new_v4();
+        let endpoints = vec![ep("127.0.0.1", 30001, Scheme::Http)];
+
+        let result = selector.select(id, &endpoints).await;
+        assert!(result.is_err(), "loopback should be blocked by SSRF");
+        assert!(
+            matches!(result.unwrap_err(), SelectionError::NoBackendsResolved),
+            "should be NoBackendsResolved"
+        );
+    }
+
+    /// With ssrf disabled, selector allows loopback endpoints.
+    #[tokio::test]
+    async fn selector_ssrf_off_allows_loopback() {
+        let ssrf_guard = Arc::new(SsrfGuard::disabled());
+        let selector = PingoraEndpointSelector::new(ssrf_guard);
+        let id = Uuid::new_v4();
+        let endpoints = vec![ep("127.0.0.1", 30001, Scheme::Http)];
+
+        let result = selector.select(id, &endpoints).await;
+        assert!(result.is_ok(), "loopback allowed when SSRF off");
     }
 }

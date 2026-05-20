@@ -3,7 +3,6 @@ use modkit_db::secure::InfraError;
 use modkit_db::secure::ScopeError;
 use modkit_macros::domain_model;
 use thiserror::Error;
-use users_info_sdk::UsersInfoError;
 use uuid::Uuid;
 
 /// Domain-specific errors using thiserror
@@ -96,32 +95,6 @@ impl DomainError {
     }
 }
 
-/// Convert domain errors to SDK errors for public API consumption.
-impl From<DomainError> for UsersInfoError {
-    fn from(domain_error: DomainError) -> Self {
-        match domain_error {
-            DomainError::EmailAlreadyExists { email } => UsersInfoError::conflict(email),
-            DomainError::InvalidEmail { email } => {
-                UsersInfoError::validation(format!("Invalid email: {email}"))
-            }
-            DomainError::EmptyDisplayName => {
-                UsersInfoError::validation("Display name cannot be empty")
-            }
-            DomainError::DisplayNameTooLong { len, max } => UsersInfoError::validation(format!(
-                "Display name too long: {len} characters (max: {max})"
-            )),
-            DomainError::Validation { field, message } => {
-                UsersInfoError::validation(format!("{field}: {message}"))
-            }
-            DomainError::UserNotFound { id } | DomainError::NotFound { id, .. } => {
-                UsersInfoError::not_found(id)
-            }
-            DomainError::Forbidden => UsersInfoError::forbidden(),
-            DomainError::Database { .. } | DomainError::InternalError => UsersInfoError::internal(),
-        }
-    }
-}
-
 impl From<Box<dyn std::error::Error>> for DomainError {
     fn from(value: Box<dyn std::error::Error>) -> Self {
         tracing::debug!(error = %value, "Converting boxed error to DomainError");
@@ -130,12 +103,17 @@ impl From<Box<dyn std::error::Error>> for DomainError {
     }
 }
 
+// TODO(DE1302): `DomainError::database(...)` only accepts a String, so these
+// From impls drop the source error. Extend `Database` to hold a boxed source
+// so `.source()` returns the original error, then remove these allows.
+#[allow(unknown_lints, de1302_error_from_to_string)]
 impl From<DbError> for DomainError {
     fn from(e: DbError) -> Self {
         DomainError::database(e.to_string())
     }
 }
 
+#[allow(unknown_lints, de1302_error_from_to_string)]
 impl From<ScopeError> for DomainError {
     fn from(e: ScopeError) -> Self {
         DomainError::database(e.to_string())

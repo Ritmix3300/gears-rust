@@ -766,6 +766,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base16ct"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c7f02d4ea65f2c1853089ffd8d2787bdbc63de2f0d29dedbcf8ccdfa0ccd4cf"
+
+[[package]]
 name = "base64"
 version = "0.21.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1875,7 +1881,9 @@ name = "cyberware-account-management"
 version = "0.1.1"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "async-trait",
+ "bigdecimal",
  "cyberware-account-management-sdk",
  "cyberware-authz-resolver-sdk",
  "cyberware-modkit",
@@ -1885,12 +1893,16 @@ dependencies = [
  "cyberware-modkit-macros",
  "cyberware-modkit-odata",
  "cyberware-modkit-security",
+ "cyberware-modkit-utils",
  "cyberware-resource-group-sdk",
  "cyberware-tenant-resolver-sdk",
  "cyberware-types-registry-sdk",
  "fnv",
  "futures",
  "gts",
+ "jsonschema",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "parking_lot",
  "proptest",
  "sea-orm",
@@ -1913,11 +1925,19 @@ name = "cyberware-account-management-sdk"
 version = "0.1.1"
 dependencies = [
  "async-trait",
- "cyberware-modkit-canonical-errors",
+ "cyberware-modkit",
+ "cyberware-modkit-gts",
+ "cyberware-modkit-odata",
+ "cyberware-modkit-odata-macros",
+ "cyberware-modkit-security",
  "cyberware-tenant-resolver-sdk",
  "gts",
+ "gts-macros",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
+ "thiserror 2.0.18",
+ "time",
  "tokio",
  "uuid",
 ]
@@ -1934,6 +1954,7 @@ dependencies = [
  "chrono",
  "cyberware-authn-resolver-sdk",
  "cyberware-modkit",
+ "cyberware-modkit-canonical-errors",
  "cyberware-modkit-http",
  "cyberware-modkit-macros",
  "cyberware-modkit-security",
@@ -1990,6 +2011,7 @@ version = "0.3.16"
 dependencies = [
  "async-trait",
  "cyberware-modkit",
+ "cyberware-modkit-gts",
  "cyberware-modkit-security",
  "gts",
  "gts-macros",
@@ -2027,7 +2049,9 @@ version = "0.3.6"
 dependencies = [
  "async-trait",
  "cyberware-modkit",
+ "cyberware-modkit-gts",
  "cyberware-modkit-security",
+ "cyberware-tenant-resolver-sdk",
  "gts",
  "gts-macros",
  "schemars 1.2.1",
@@ -2067,6 +2091,7 @@ version = "0.1.24"
 dependencies = [
  "async-trait",
  "cyberware-modkit",
+ "cyberware-modkit-gts",
  "cyberware-modkit-security",
  "cyberware-tenant-resolver-sdk",
  "gts",
@@ -2116,7 +2141,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "types",
  "users-info",
 ]
 
@@ -2147,6 +2171,18 @@ dependencies = [
  "tracing",
  "utoipa",
  "uuid",
+]
+
+[[package]]
+name = "cyberware-fips-probe"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cyberware-modkit",
+ "cyberware-modkit-http",
+ "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2187,15 +2223,19 @@ dependencies = [
  "cyberware-authz-resolver-sdk",
  "cyberware-mini-chat-sdk",
  "cyberware-modkit",
+ "cyberware-modkit-canonical-errors",
  "cyberware-modkit-db",
  "cyberware-modkit-db-macros",
+ "cyberware-modkit-gts",
  "cyberware-modkit-macros",
  "cyberware-modkit-odata",
  "cyberware-modkit-security",
  "cyberware-modkit-utils",
  "cyberware-oagw-sdk",
+ "cyberware-types-registry",
  "cyberware-types-registry-sdk",
  "futures",
+ "gts",
  "heck 0.5.0",
  "http",
  "image",
@@ -2229,6 +2269,7 @@ version = "0.10.6"
 dependencies = [
  "async-trait",
  "cyberware-modkit",
+ "cyberware-modkit-gts",
  "gts",
  "gts-macros",
  "schemars 1.2.1",
@@ -2253,11 +2294,13 @@ dependencies = [
  "chrono",
  "cyberware-modkit-canonical-errors",
  "cyberware-modkit-db",
- "cyberware-modkit-errors",
+ "cyberware-modkit-gts",
  "cyberware-modkit-macros",
  "cyberware-modkit-odata",
  "cyberware-modkit-sdk",
  "cyberware-modkit-utils",
+ "cyberware-rustls-corecrypto-provider",
+ "cyberware-rustls-fips-shim",
  "cyberware-system-sdks",
  "dashmap",
  "dsn",
@@ -2277,6 +2320,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "rustls",
+ "rustls-cng-crypto",
  "schemars 1.2.1",
  "sea-orm-migration",
  "serde",
@@ -2297,12 +2341,12 @@ dependencies = [
  "tracing-log",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "tracing-test",
  "trybuild",
  "url",
  "urlencoding",
  "utoipa",
  "uuid",
- "zip 4.6.1",
 ]
 
 [[package]]
@@ -2416,25 +2460,27 @@ dependencies = [
 ]
 
 [[package]]
-name = "cyberware-modkit-errors"
-version = "0.7.0"
+name = "cyberware-modkit-gts"
+version = "0.1.0"
 dependencies = [
- "axum",
- "http",
+ "anyhow",
+ "cyberware-modkit-gts-macro",
+ "gts",
+ "gts-macros",
+ "inventory",
+ "schemars 1.2.1",
  "serde",
  "serde_json",
- "tracing",
- "utoipa",
 ]
 
 [[package]]
-name = "cyberware-modkit-errors-macro"
-version = "0.6.3"
+name = "cyberware-modkit-gts-macro"
+version = "0.1.0"
 dependencies = [
+ "gts-macros",
+ "proc-macro-crate",
  "proc-macro2",
  "quote",
- "serde",
- "serde_json",
  "syn 2.0.117",
 ]
 
@@ -2443,6 +2489,8 @@ name = "cyberware-modkit-http"
 version = "0.6.5"
 dependencies = [
  "bytes",
+ "cyberware-rustls-corecrypto-provider",
+ "cyberware-rustls-fips-shim",
  "flate2",
  "http",
  "http-body",
@@ -2457,6 +2505,7 @@ dependencies = [
  "pin-project-lite",
  "rand 0.10.1",
  "rustls",
+ "rustls-cng-crypto",
  "rustls-native-certs 0.8.3",
  "rustls-pki-types",
  "serde",
@@ -2469,6 +2518,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "webpki-roots 1.0.6",
 ]
 
 [[package]]
@@ -2526,8 +2576,7 @@ dependencies = [
  "bigdecimal",
  "chrono",
  "chrono-tz",
- "cyberware-modkit-errors",
- "cyberware-modkit-errors-macro",
+ "cyberware-modkit-canonical-errors",
  "hex",
  "http",
  "peg",
@@ -2535,6 +2584,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
+ "tracing",
  "utoipa",
  "uuid",
 ]
@@ -2752,6 +2802,7 @@ dependencies = [
  "axum",
  "cyberware-authz-resolver-sdk",
  "cyberware-modkit",
+ "cyberware-modkit-canonical-errors",
  "cyberware-modkit-db",
  "cyberware-modkit-db-macros",
  "cyberware-modkit-macros",
@@ -2782,6 +2833,7 @@ version = "0.1.3"
 dependencies = [
  "async-trait",
  "cyberware-modkit",
+ "cyberware-modkit-gts",
  "cyberware-modkit-odata",
  "cyberware-modkit-odata-macros",
  "cyberware-modkit-sdk",
@@ -2815,6 +2867,37 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "cyberware-rustls-corecrypto-provider"
+version = "0.1.0"
+dependencies = [
+ "core-foundation 0.10.1",
+ "core-foundation-sys",
+ "hex",
+ "pkcs8",
+ "rcgen",
+ "rsa",
+ "rustls",
+ "sec1",
+ "security-framework 3.7.0",
+ "security-framework-sys",
+ "sha2",
+ "subtle",
+ "temp-env",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "cyberware-rustls-fips-shim"
+version = "0.1.0"
+dependencies = [
+ "hyper-rustls",
+ "rustls",
 ]
 
 [[package]]
@@ -3006,6 +3089,7 @@ version = "0.3.6"
 dependencies = [
  "async-trait",
  "cyberware-modkit",
+ "cyberware-modkit-gts",
  "cyberware-modkit-odata",
  "cyberware-modkit-security",
  "gts",
@@ -3046,6 +3130,7 @@ dependencies = [
  "axum",
  "cyberware-modkit",
  "cyberware-modkit-canonical-errors",
+ "cyberware-modkit-gts",
  "cyberware-modkit-macros",
  "cyberware-modkit-security",
  "cyberware-modkit-utils",
@@ -3071,6 +3156,26 @@ dependencies = [
  "gts",
  "serde_json",
  "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
+name = "cyberware-usage-collector-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "cyberware-authz-resolver-sdk",
+ "cyberware-modkit",
+ "cyberware-modkit-canonical-errors",
+ "cyberware-modkit-security",
+ "gts",
+ "gts-macros",
+ "schemars 1.2.1",
+ "serde",
+ "serde_json",
+ "tokio",
+ "utoipa",
  "uuid",
 ]
 
@@ -4058,6 +4163,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gts-analyze"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "proc-macro2",
+ "regex",
+ "serde",
+ "serde_json",
+ "syn 2.0.117",
+ "walkdir",
+]
+
+[[package]]
 name = "gts-id"
 version = "0.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4520,7 +4639,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -7702,8 +7821,24 @@ dependencies = [
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki",
+ "rustls-webpki 0.103.13",
  "subtle",
+ "zeroize",
+]
+
+[[package]]
+name = "rustls-cng-crypto"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94b394e41f2dcbc1115eb8d7e224b5ecd36ea8df39d493545012c81b198b1db7"
+dependencies = [
+ "once_cell",
+ "pkcs1",
+ "pkcs8",
+ "rustls",
+ "rustls-webpki 0.102.8",
+ "sec1",
+ "windows 0.58.0",
  "zeroize",
 ]
 
@@ -7748,6 +7883,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30a7197ae7eb376e574fe940d068c30fe0462554a3ddbe4eca7838e049c937a9"
 dependencies = [
  "zeroize",
+]
+
+[[package]]
+name = "rustls-webpki"
+version = "0.102.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "64ca1bc8749bd4cf37b5ce386cc146580777b4e8572c7b97baf22c83f444bee9"
+dependencies = [
+ "rustls-pki-types",
+ "untrusted 0.9.0",
 ]
 
 [[package]]
@@ -8034,6 +8179,19 @@ name = "seahash"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1c107b6f4780854c8b126e228ea8869f4d7b71260f962fefb57b996b8959ba6b"
+
+[[package]]
+name = "sec1"
+version = "0.7.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3e97a565f76233a6003f9f5c54be1d9c5bdfa3eccfb189469f11ec4901c47dc"
+dependencies = [
+ "base16ct",
+ "der",
+ "generic-array",
+ "pkcs8",
+ "zeroize",
+]
 
 [[package]]
 name = "secrecy"
@@ -8956,7 +9114,7 @@ dependencies = [
  "ntapi",
  "objc2-core-foundation",
  "objc2-io-kit",
- "windows",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -9694,34 +9852,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
 
 [[package]]
-name = "types"
-version = "0.6.1"
-dependencies = [
- "anyhow",
- "arc-swap",
- "async-trait",
- "cyberware-modkit",
- "cyberware-modkit-macros",
- "cyberware-modkit-security",
- "cyberware-types-registry-sdk",
- "inventory",
- "tracing",
- "types-sdk",
-]
-
-[[package]]
-name = "types-sdk"
-version = "0.6.3"
-dependencies = [
- "async-trait",
- "cyberware-modkit-odata",
- "cyberware-modkit-security",
- "thiserror 2.0.18",
- "time",
- "uuid",
-]
-
-[[package]]
 name = "ucd-trie"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9925,13 +10055,13 @@ name = "users-info-sdk"
 version = "0.6.1"
 dependencies = [
  "async-trait",
+ "cyberware-modkit-canonical-errors",
  "cyberware-modkit-odata",
  "cyberware-modkit-odata-macros",
  "cyberware-modkit-sdk",
  "cyberware-modkit-security",
  "futures",
  "futures-core",
- "thiserror 2.0.18",
  "time",
  "tokio",
  "uuid",
@@ -9955,7 +10085,6 @@ dependencies = [
  "cyberware-types-registry",
  "tokio",
  "tracing",
- "types",
  "users-info",
 ]
 
@@ -10356,12 +10485,22 @@ checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windows"
+version = "0.58.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd04d41d93c4992d421894c18c8b43496aa748dd4c081bac0dc93eb0489272b6"
+dependencies = [
+ "windows-core 0.58.0",
+ "windows-targets 0.52.6",
+]
+
+[[package]]
+name = "windows"
 version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "527fadee13e0c05939a6a05d5bd6eec6cd2e3dbd648b9f8e447c6518133d8580"
 dependencies = [
  "windows-collections",
- "windows-core",
+ "windows-core 0.62.2",
  "windows-future",
  "windows-numerics",
 ]
@@ -10372,7 +10511,20 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b2d95af1a8a14a3c7367e1ed4fc9c20e0a26e79551b1454d72583c97cc6610"
 dependencies = [
- "windows-core",
+ "windows-core 0.62.2",
+]
+
+[[package]]
+name = "windows-core"
+version = "0.58.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6ba6d44ec8c2591c134257ce647b7ea6b20335bf6379a27dac5f1641fcf59f99"
+dependencies = [
+ "windows-implement 0.58.0",
+ "windows-interface 0.58.0",
+ "windows-result 0.2.0",
+ "windows-strings 0.1.0",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -10381,11 +10533,11 @@ version = "0.62.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8e83a14d34d0623b51dce9581199302a221863196a1dde71a7663a4c2be9deb"
 dependencies = [
- "windows-implement",
- "windows-interface",
+ "windows-implement 0.60.2",
+ "windows-interface 0.59.3",
  "windows-link",
- "windows-result",
- "windows-strings",
+ "windows-result 0.4.1",
+ "windows-strings 0.5.1",
 ]
 
 [[package]]
@@ -10394,9 +10546,20 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1d6f90251fe18a279739e78025bd6ddc52a7e22f921070ccdc67dde84c605cb"
 dependencies = [
- "windows-core",
+ "windows-core 0.62.2",
  "windows-link",
  "windows-threading",
+]
+
+[[package]]
+name = "windows-implement"
+version = "0.58.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2bbd5b46c938e506ecbce286b6628a02171d56153ba733b6c741fc627ec9579b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -10404,6 +10567,17 @@ name = "windows-implement"
 version = "0.60.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "053e2e040ab57b9dc951b72c264860db7eb3b0200ba345b4e4c3b14f67855ddf"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "windows-interface"
+version = "0.58.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "053c4c462dc91d3b1504c6fe5a726dd15e216ba718e84a0e46a88fbe5ded3515"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -10433,7 +10607,7 @@ version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e2e40844ac143cdb44aead537bbf727de9b044e107a0f1220392177d15b0f26"
 dependencies = [
- "windows-core",
+ "windows-core 0.62.2",
  "windows-link",
 ]
 
@@ -10444,8 +10618,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02752bf7fbdcce7f2a27a742f798510f3e5ad88dbe84871e5168e2120c3d5720"
 dependencies = [
  "windows-link",
- "windows-result",
- "windows-strings",
+ "windows-result 0.4.1",
+ "windows-strings 0.5.1",
+]
+
+[[package]]
+name = "windows-result"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d1043d8214f791817bab27572aaa8af63732e11bf84aa21a45a78d6c317ae0e"
+dependencies = [
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
@@ -10455,6 +10638,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
 dependencies = [
  "windows-link",
+]
+
+[[package]]
+name = "windows-strings"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cd9b125c486025df0eabcb585e62173c6c9eddcec5d117d3b6e8c30e2ee4d10"
+dependencies = [
+ "windows-result 0.2.0",
+ "windows-targets 0.52.6",
 ]
 
 [[package]]
