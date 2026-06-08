@@ -6,6 +6,7 @@ Supports unit tests, e2e tests, and combined coverage.
 import argparse
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -31,6 +32,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent.absolute()
 COVERAGE_DIR = PROJECT_ROOT / "coverage"
 PYTHON = sys.executable or "python3"
 COVERAGE_THRESHOLD = 80
+MIN_COVERAGE_FREE_SPACE_GIB = 5
 
 E2E_SERVER_FEATURES = read_e2e_features(PROJECT_ROOT)
 
@@ -39,6 +41,19 @@ E2E_SERVER_FEATURES = read_e2e_features(PROJECT_ROOT)
 LOCAL_COVERAGE_SKIPPED_TESTS = [
     "generic_postgres",
     "generic_mysql",
+    "mysql_params_smoke",
+    "pg_clean_two_node_tree_yields_no_violations",
+    "pg_concurrent_approves_serialize_to_one_winner",
+    "pg_cycle_classifier_detects_self_loop",
+    "pg_fk_cascade_removes_metadata_when_tenant_row_dropped",
+    "pg_happy_path_approve_flips_self_managed_and_barrier",
+    "pg_hard_delete_one_clears_metadata_via_combined_path",
+    "pg_orphan_classifier_detects_seeded_orphan",
+    "pg_params_smoke",
+    "pg_repair_inserts_missing_coverage_gap_in_serializable_tx",
+    "pg_root_classifier_detects_two_roots",
+    "pg_single_pending_unique_index_rejects_second_insert",
+    "pg_stale_closure_classifier_detects_dangling_descendant",
 ]
 
 FILE_PATH_COL_WIDTH = 70
@@ -94,6 +109,28 @@ def ensure_tool(binary, install_hint=None):
             msg += f". Install with: {install_hint}"
         print(msg, file=sys.stderr)
         sys.exit(1)
+
+
+def ensure_coverage_disk_space():
+    min_free_gib = float(
+        os.environ.get("COVERAGE_MIN_FREE_GIB", MIN_COVERAGE_FREE_SPACE_GIB)
+    )
+    usage = shutil.disk_usage(PROJECT_ROOT)
+    free_gib = usage.free / (1024 ** 3)
+    if free_gib >= min_free_gib:
+        return
+
+    print(
+        "ERROR: insufficient free disk space for coverage build: "
+        f"{free_gib:.1f} GiB available, at least {min_free_gib:.1f} GiB required.\n"
+        "Coverage builds large instrumented test binaries. Free space under the "
+        "workspace volume, then retry. Common cleanup commands:\n"
+        "  cargo llvm-cov clean --workspace\n"
+        "  cargo clean\n"
+        "  rm -rf tools/dylint_lints/target",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def wait_for_health(base_url, timeout_secs=30, log_path: Optional[Path] = None):
@@ -1322,6 +1359,7 @@ Examples:
         print("WARNING: Skipping environment prerequisite validation")
         print("This may cause failures if required tools are not installed.")
 
+    ensure_coverage_disk_space()
     args.func(args)
 
 
