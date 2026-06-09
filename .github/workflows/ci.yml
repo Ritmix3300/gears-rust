@@ -51,8 +51,8 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Validate module naming conventions
-        run: python3 tools/scripts/validate_module_names.py
+      - name: Validate gear naming conventions
+        run: python3 tools/scripts/validate_gear_names.py
 
       - name: Install Go (required for aws-lc-fips-sys FIPS build)
         uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
@@ -350,6 +350,9 @@ jobs:
         with:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN }}
           components: llvm-tools-preview,rustc-dev
+
+      - name: Set Rust nightly for Dylint temp builds
+        run: rustup override set ${{ env.RUSTUP_TOOLCHAIN }} --path /tmp
 
       - name: Install dylint-link and nextest
         uses: taiki-e/install-action@6ef672efc2b5aabc787a9e94baf4989aa02a97df # v2.70.3

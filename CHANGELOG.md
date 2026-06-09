@@ -284,7 +284,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- *(account-management)* tenant service domain layer + AM module entry-point (by @diffora)
+- *(account-management)* tenant service domain layer + AM gear entry-point (by @diffora)
 - *(account-management)* SDK + storage-floor + planning docs (by @diffora)
 
 ### Fixed
@@ -301,7 +301,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- *(account-management)* tenant service domain layer + AM module entry-point (by @diffora)
+- *(account-management)* tenant service domain layer + AM gear entry-point (by @diffora)
 - *(account-management)* SDK + storage-floor + planning docs (by @diffora)
 
 ### Fixed
@@ -964,7 +964,7 @@ release-plz updates this file in the Release PR.
 
 ### Fixed
 
-- fix test_reject_duplicate_keys_in_module_file test on windows (by @lansfy) - #1336
+- fix test_reject_duplicate_keys_in_gear_file test on windows (by @lansfy) - #1336
 
 ### Other
 
@@ -1686,7 +1686,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Other
 
@@ -1701,7 +1701,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 - *(oagw)* wire credstore SDK into OAGW, replacing InMemoryCredentialResolver (by @refur-nfn)
 - *(credstore)* add static-credstore-plugin module (by @refur-nfn)
 
@@ -1721,7 +1721,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Other
 
@@ -1736,7 +1736,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Other
 
@@ -1751,7 +1751,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Other
 
@@ -1778,7 +1778,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Other
 
@@ -1793,7 +1793,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 - *(oagw)* wire credstore SDK into OAGW, replacing InMemoryCredentialResolver (by @refur-nfn)
 - *(credstore)* add static-credstore-plugin module (by @refur-nfn)
 
@@ -1813,7 +1813,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Other
 
@@ -1828,7 +1828,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Other
 
@@ -1843,117 +1843,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
-
-### Other
-
-- release (by @github-actions[bot]) - #788
-
-### Contributors
-
-* @github-actions[bot]
-* @fluiderson
-
-## [0.3.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-toolkit-http-v0.2.14...cf-gears-toolkit-http-v0.3.1) - 2026-03-06
-
-### Other
-
-- Set AllowInsecureHttp by default in toolkit-http config, add deny_insecure_http method for TLS enforcement. (by @genericaccount-de) - #868
-- *(cargo)* unify TLS stack and clean up SeaORM/sqlx feature wiring (by @MikeFalcon77)
-
-### Contributors
-
-* @genericaccount-de
-* @MikeFalcon77
-
-## [0.3.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-toolkit-v0.2.14...cf-gears-toolkit-v0.3.1) - 2026-03-06
-
-### Added
-
-- *(mini-chat)* implement CRUD for /v1/chats (by @aviator5)
-
-### Other
-
-- Merge pull request #783 from dominic1988-lgtm/460v4 (by @MikeFalcon77) - #783
-- Merge pull request #719 from genericaccount-de/feature/REAL-163-prometheus-metrics (by @MikeFalcon77) - #719
-- Add metrics recorder with cardinality control and ability to export data, REAL-163 (by @genericaccount-de) - #719
-
-### Contributors
-
-* @MikeFalcon77
-* @aviator5
-* @genericaccount-de
-
-## [0.1.4](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-tr-plugin-v0.1.3...cf-gears-static-tr-plugin-v0.1.4) - 2026-03-06
-
-### Added
-
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
-
-### Other
-
-- release (by @github-actions[bot]) - #788
-
-### Contributors
-
-* @github-actions[bot]
-* @fluiderson
-
-## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-static-credstore-plugin-v0.1.0) - 2026-03-06
-
-### Added
-
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
-- *(oagw)* wire credstore SDK into OAGW, replacing InMemoryCredentialResolver (by @refur-nfn)
-- *(credstore)* add static-credstore-plugin module (by @refur-nfn)
-
-### Other
-
-- release (by @github-actions[bot]) - #788
-- Merge pull request #806 from refur-nfn/feat/credstore-test-coverage (by @Artifizer) - #806
-
-### Contributors
-
-* @github-actions[bot]
-* @Artifizer
-* @fluiderson
-* @refur-nfn
-
-## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-authz-plugin-v0.1.1...cf-gears-static-authz-plugin-v0.1.2) - 2026-03-06
-
-### Added
-
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
-
-### Other
-
-- release (by @github-actions[bot]) - #788
-
-### Contributors
-
-* @github-actions[bot]
-* @fluiderson
-
-## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-authn-plugin-v0.1.1...cf-gears-static-authn-plugin-v0.1.2) - 2026-03-06
-
-### Added
-
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
-
-### Other
-
-- release (by @github-actions[bot]) - #788
-
-### Contributors
-
-* @github-actions[bot]
-* @fluiderson
-
-## [0.1.4](https://github.com/constructorfabric/gears-rust/compare/cf-single-tenant-tr-plugin-v0.1.3...cf-single-tenant-tr-plugin-v0.1.4) - 2026-03-06
-
-### Added
-
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Other
 
@@ -1998,7 +1888,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Other
 
@@ -2013,7 +1903,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 - *(oagw)* wire credstore SDK into OAGW, replacing InMemoryCredentialResolver (by @refur-nfn)
 - *(credstore)* add static-credstore-plugin module (by @refur-nfn)
 
@@ -2033,7 +1923,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Other
 
@@ -2048,7 +1938,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Other
 
@@ -2063,7 +1953,117 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
+
+### Other
+
+- release (by @github-actions[bot]) - #788
+
+### Contributors
+
+* @github-actions[bot]
+* @fluiderson
+
+## [0.3.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-toolkit-http-v0.2.14...cf-gears-toolkit-http-v0.3.1) - 2026-03-06
+
+### Other
+
+- Set AllowInsecureHttp by default in toolkit-http config, add deny_insecure_http method for TLS enforcement. (by @genericaccount-de) - #868
+- *(cargo)* unify TLS stack and clean up SeaORM/sqlx feature wiring (by @MikeFalcon77)
+
+### Contributors
+
+* @genericaccount-de
+* @MikeFalcon77
+
+## [0.3.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-toolkit-v0.2.14...cf-gears-toolkit-v0.3.1) - 2026-03-06
+
+### Added
+
+- *(mini-chat)* implement CRUD for /v1/chats (by @aviator5)
+
+### Other
+
+- Merge pull request #783 from dominic1988-lgtm/460v4 (by @MikeFalcon77) - #783
+- Merge pull request #719 from genericaccount-de/feature/REAL-163-prometheus-metrics (by @MikeFalcon77) - #719
+- Add metrics recorder with cardinality control and ability to export data, REAL-163 (by @genericaccount-de) - #719
+
+### Contributors
+
+* @MikeFalcon77
+* @aviator5
+* @genericaccount-de
+
+## [0.1.4](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-tr-plugin-v0.1.3...cf-gears-static-tr-plugin-v0.1.4) - 2026-03-06
+
+### Added
+
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
+
+### Other
+
+- release (by @github-actions[bot]) - #788
+
+### Contributors
+
+* @github-actions[bot]
+* @fluiderson
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-static-credstore-plugin-v0.1.0) - 2026-03-06
+
+### Added
+
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
+- *(oagw)* wire credstore SDK into OAGW, replacing InMemoryCredentialResolver (by @refur-nfn)
+- *(credstore)* add static-credstore-plugin module (by @refur-nfn)
+
+### Other
+
+- release (by @github-actions[bot]) - #788
+- Merge pull request #806 from refur-nfn/feat/credstore-test-coverage (by @Artifizer) - #806
+
+### Contributors
+
+* @github-actions[bot]
+* @Artifizer
+* @fluiderson
+* @refur-nfn
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-authz-plugin-v0.1.1...cf-gears-static-authz-plugin-v0.1.2) - 2026-03-06
+
+### Added
+
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
+
+### Other
+
+- release (by @github-actions[bot]) - #788
+
+### Contributors
+
+* @github-actions[bot]
+* @fluiderson
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-authn-plugin-v0.1.1...cf-gears-static-authn-plugin-v0.1.2) - 2026-03-06
+
+### Added
+
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
+
+### Other
+
+- release (by @github-actions[bot]) - #788
+
+### Contributors
+
+* @github-actions[bot]
+* @fluiderson
+
+## [0.1.4](https://github.com/constructorfabric/gears-rust/compare/cf-single-tenant-tr-plugin-v0.1.3...cf-single-tenant-tr-plugin-v0.1.4) - 2026-03-06
+
+### Added
+
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Other
 
@@ -2107,7 +2107,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Other
 
@@ -2122,7 +2122,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 - *(oagw)* wire credstore SDK into OAGW, replacing InMemoryCredentialResolver (by @refur-nfn)
 - *(credstore)* add static-credstore-plugin module (by @refur-nfn)
 
@@ -2142,7 +2142,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Other
 
@@ -2157,7 +2157,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Other
 
@@ -2172,7 +2172,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Other
 
@@ -2216,7 +2216,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Contributors
 
@@ -2226,7 +2226,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 - *(oagw)* wire credstore SDK into OAGW, replacing InMemoryCredentialResolver (by @refur-nfn)
 - *(credstore)* add static-credstore-plugin module (by @refur-nfn)
 
@@ -2244,7 +2244,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Contributors
 
@@ -2254,7 +2254,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Contributors
 
@@ -2264,7 +2264,7 @@ release-plz updates this file in the Release PR.
 
 ### Added
 
-- centralize module initialization logging in `HostRuntime` (by @fluiderson) - #845
+- centralize gear initialization logging in `HostRuntime` (by @fluiderson) - #845
 
 ### Contributors
 

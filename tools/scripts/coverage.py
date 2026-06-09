@@ -6,6 +6,7 @@ Supports unit tests, e2e tests, and combined coverage.
 import argparse
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -18,7 +19,7 @@ from urllib.error import URLError, HTTPError
 
 import yaml
 
-# Import prereq module for environment validation
+# Import prereq gear for environment validation
 from lib.prereq import check_environment_ready
 from lib.platform import (
     find_binary,
@@ -27,19 +28,46 @@ from lib.platform import (
     stop_process_tree,
 )
 
-PROJECT_ROOT = Path(__file__).parent.parent.absolute()
+PROJECT_ROOT = Path(__file__).parent.parent.parent.absolute()
 COVERAGE_DIR = PROJECT_ROOT / "coverage"
 PYTHON = sys.executable or "python3"
 COVERAGE_THRESHOLD = 80
+MIN_COVERAGE_FREE_SPACE_GIB = 5
 
 E2E_SERVER_FEATURES = read_e2e_features(PROJECT_ROOT)
+E2E_SERVER_PACKAGE = "cf-gears-example-server"
+E2E_SERVER_BINARY = "cf-gears-example-server"
 
 # Local coverage should not require Docker-backed DB containers.
 # These tests are covered in dedicated DB/integration pipelines.
 LOCAL_COVERAGE_SKIPPED_TESTS = [
     "generic_postgres",
     "generic_mysql",
+    "mysql_params_smoke",
+    "pg_clean_two_node_tree_yields_no_violations",
+    "pg_concurrent_approves_serialize_to_one_winner",
+    "pg_cycle_classifier_detects_self_loop",
+    "pg_fk_cascade_removes_metadata_when_tenant_row_dropped",
+    "pg_happy_path_approve_flips_self_managed_and_barrier",
+    "pg_hard_delete_one_clears_metadata_via_combined_path",
+    "pg_orphan_classifier_detects_seeded_orphan",
+    "pg_params_smoke",
+    "pg_repair_inserts_missing_coverage_gap_in_serializable_tx",
+    "pg_root_classifier_detects_two_roots",
+    "pg_single_pending_unique_index_rejects_second_insert",
+    "pg_stale_closure_classifier_detects_dangling_descendant",
 ]
+
+def append_local_coverage_features(cmd, include_server_features=True):
+    if not include_server_features:
+        return
+    if E2E_SERVER_FEATURES:
+        features = ",".join(
+            f"cf-gears-example-server/{feature.strip()}"
+            for feature in E2E_SERVER_FEATURES.split(",")
+            if feature.strip()
+        )
+        cmd.extend(["--features", features])
 
 FILE_PATH_COL_WIDTH = 70
 COVERAGE_CELL_COL_WIDTH = 18
@@ -94,6 +122,28 @@ def ensure_tool(binary, install_hint=None):
             msg += f". Install with: {install_hint}"
         print(msg, file=sys.stderr)
         sys.exit(1)
+
+
+def ensure_coverage_disk_space():
+    min_free_gib = float(
+        os.environ.get("COVERAGE_MIN_FREE_GIB", MIN_COVERAGE_FREE_SPACE_GIB)
+    )
+    usage = shutil.disk_usage(PROJECT_ROOT)
+    free_gib = usage.free / (1024 ** 3)
+    if free_gib >= min_free_gib:
+        return
+
+    print(
+        "ERROR: insufficient free disk space for coverage build: "
+        f"{free_gib:.1f} GiB available, at least {min_free_gib:.1f} GiB required.\n"
+        "Coverage builds large instrumented test binaries. Free space under the "
+        "workspace volume, then retry. Common cleanup commands:\n"
+        "  cargo llvm-cov clean --workspace\n"
+        "  cargo clean\n"
+        "  rm -rf tools/dylint_lints/target",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 
 
 def wait_for_health(base_url, timeout_secs=30, log_path: Optional[Path] = None):
@@ -221,7 +271,7 @@ def make_relative_path(filepath, project_root):
     s = str(filepath).replace("\\", "/")
     if s.startswith("./"):
         s = s[2:]
-    # If it's already a libs/ or modules/ or apps/ relative path, accept it
+    # If it's already a libs/ or gears/ or apps/ relative path, accept it
     if s.startswith("libs/") or s.startswith("gears/") or s.startswith("apps/"):
         return s
     # Otherwise try to relativize
@@ -232,7 +282,7 @@ def make_relative_path(filepath, project_root):
 
 
 def categorize_file(rel_path):
-    """Categorize file into: 'file', 'module', 'lib', or 'external'."""
+    """Categorize file into: 'file', 'gear', 'lib', or 'external'."""
     # Normalize leading './'
     rel_path = rel_path[2:] if rel_path.startswith('./') else rel_path
     if rel_path.startswith('libs/'):
@@ -241,8 +291,8 @@ def categorize_file(rel_path):
         if len(parts) >= 2:
             return 'lib', parts[1]
         return 'file', None
-    elif rel_path.startswith('modules/'):
-        # gears/system/ contains nested submodules (oagw, api-gateway, …).
+    elif rel_path.startswith('gears/'):
+        # gears/system/ contains nested gears (oagw, api-gateway, …).
         # Use the submodule name so each one gets its own report row.
         parts = rel_path.split('/')
         if len(parts) >= 3 and parts[1] == 'system':
@@ -259,10 +309,10 @@ def categorize_file(rel_path):
 
 
 def enumerate_project_rs_files(project_root):
-    """List Rust source files under libs/ and modules/ as relative paths."""
+    """List Rust source files under libs/ and gears/ as relative paths."""
     root = Path(project_root)
     rels = []
-    for top in [root / "libs", root / "modules"]:
+    for top in [root / "libs", root / "gears"]:
         if not top.exists():
             continue
         for p in top.rglob("*.rs"):
@@ -288,7 +338,7 @@ def count_non_empty_lines(abs_path):
 
 def aggregate_coverage_data(files_data, project_root):
     """
-    Aggregate coverage data by files, modules, and libs.
+    Aggregate coverage data by files, gears, and libs.
     Returns: (individual_files, aggregated_groups, total)
     """
     individual_files = []
@@ -329,7 +379,7 @@ def aggregate_coverage_data(files_data, project_root):
         # Add to individual files
         individual_files.append(file_stats)
 
-        # Aggregate into groups (modules/libs)
+        # Aggregate into groups (gears/libs)
         if category in ['module', 'lib'] and group_name:
             if group_name not in groups:
                 groups[group_name] = {
@@ -436,7 +486,7 @@ def format_custom_coverage_report(json_data,
     - Relative file paths
     - Merged columns with 3-line headers
     - Branch coverage
-    - Grouped by files, modules/libs, and total
+    - Grouped by files, gears/libs, and total
     - Optional color coding for coverage thresholds
     """
     data = json_data['data'][0]
@@ -508,9 +558,9 @@ def format_custom_coverage_report(json_data,
             file_stats['path'], file_stats, threshold=threshold, use_color=use_color
         ))
 
-    # Modules & Libs Section
+    # Gears & Libs Section
     lines.append("")
-    lines.extend(format_section_header("Modules & Libraries:"))
+    lines.extend(format_section_header("Gears & Libraries:"))
     for group in sorted(groups, key=lambda x: (x['type'], x['name'])):
         name = f"{group['type']}/{group['name']}"
         lines.append(format_coverage_row(
@@ -566,6 +616,7 @@ def collect_unit_coverage(
     cmd = ["cargo", "llvm-cov"]
 
     # Add package filter if provided, otherwise use workspace
+    include_server_features = test_filter is None
     if test_filter:
         cmd.extend(["--package", test_filter])
         print(f"Filtering tests: package={test_filter}")
@@ -575,7 +626,8 @@ def collect_unit_coverage(
     # Note: --branch flag requires nightly Rust and is unstable
     # Branch coverage will be 0 without it, but region coverage
     # provides good coverage metrics for Rust code
-    cmd.extend(["--all-features", "--no-report"])
+    append_local_coverage_features(cmd, include_server_features)
+    cmd.append("--no-report")
 
     # Keep local coverage independent from Docker-backed integration tests.
     cmd.append("--")
@@ -609,7 +661,7 @@ def parse_bind_addr_port(config_file):
     with open(target_real, 'r') as f:
         config = yaml.safe_load(f)
 
-    bind_addr = config.get('modules', {}).get('api-gateway', {}).get(
+    bind_addr = config.get('gears', {}).get('api-gateway', {}).get(
         'config', {}).get('bind_addr', '127.0.0.1:8080'
     )
     if ':' not in bind_addr:
@@ -673,15 +725,17 @@ def get_llvm_cov_env():
 
 def build_instrumented_server(env, target_dir: Path):
     step(
-        "Building cf-gears-server with coverage instrumentation "
+        f"Building {E2E_SERVER_BINARY} with coverage instrumentation "
         f"(features: {E2E_SERVER_FEATURES})"
     )
     run_cmd(
         [
             "cargo",
             "build",
+            "--package",
+            E2E_SERVER_PACKAGE,
             "--bin",
-            "cf-gears-server",
+            E2E_SERVER_BINARY,
             "--features",
             E2E_SERVER_FEATURES,
         ],
@@ -691,7 +745,7 @@ def build_instrumented_server(env, target_dir: Path):
 
 
 def start_instrumented_server(config_file, output_dir, port=None):
-    """Start the cf-gears-server with coverage instrumentation.
+    """Start the e2e server with coverage instrumentation.
 
     Args:
         config_file: Path to config file
@@ -699,7 +753,7 @@ def start_instrumented_server(config_file, output_dir, port=None):
         port: Optional port override (parsed from config if None)
 
     Returns:
-        tuple: (server_process, log_file, actual_port)
+        tuple: (server_process, log_file, actual_port, log_fp)
     """
     if port is None:
         port = parse_bind_addr_port(config_file)
@@ -709,7 +763,7 @@ def start_instrumented_server(config_file, output_dir, port=None):
 
     # Create output directory and log file
     output_dir.mkdir(parents=True, exist_ok=True)
-    log_file = output_dir / "cf-gears-server.log"
+    log_file = output_dir / f"{E2E_SERVER_BINARY}.log"
 
     step(
         f"Starting server with coverage instrumentation "
@@ -727,7 +781,7 @@ def start_instrumented_server(config_file, output_dir, port=None):
 
     build_instrumented_server(env2, target_dir)
 
-    server_bin = find_binary(target_dir, "debug", "cf-gears-server")
+    server_bin = find_binary(target_dir, "debug", E2E_SERVER_BINARY)
     if not server_bin.exists():
         print(f"ERROR: Instrumented server binary not found at: {server_bin}")
         sys.exit(1)
@@ -764,7 +818,7 @@ def start_instrumented_server(config_file, output_dir, port=None):
         log_fp.close()
         raise
 
-    return server_process, log_file, port
+    return server_process, log_file, port, log_fp
 
 
 def run_e2e_tests(base_url, test_filter=None):
@@ -841,7 +895,7 @@ def collect_e2e_local_coverage(
     Args:
         output_dir: Directory to store coverage reports
         config_file: Config file for server
-        test_filter: Optional test path filter (e.g., 'modules/api_gateway')
+        test_filter: Optional test path filter (e.g., 'gears/api_gateway')
         skip_build: If True, skip clean and test execution
 
     Returns:
@@ -1098,10 +1152,9 @@ def cmd_coverage_combined(args):
     unit_cmd = [
         "cargo", "llvm-cov",
         "--workspace",
-        "--all-features",
-        "--no-report",
-        "--",
     ]
+    append_local_coverage_features(unit_cmd)
+    unit_cmd.extend(["--no-report", "--"])
     for test_name in LOCAL_COVERAGE_SKIPPED_TESTS:
         unit_cmd.extend(["--skip", test_name])
 
@@ -1206,7 +1259,7 @@ Examples:
   python scripts/coverage.py e2e-local
 
   # Generate local e2e test coverage for specific module
-  python scripts/coverage.py e2e-local --filter modules/api_gateway
+  python scripts/coverage.py e2e-local --filter gears/api_gateway
 
   # Generate combined coverage (unit + e2e-local)
   python scripts/coverage.py combined
@@ -1266,7 +1319,7 @@ Examples:
         "--filter",
         help=(
             "Filter E2E tests by path relative to testing/e2e "
-            "(e.g., modules/api_gateway)"
+            "(e.g., gears/api_gateway)"
         ),
         default=None
     )
@@ -1322,6 +1375,7 @@ Examples:
         print("WARNING: Skipping environment prerequisite validation")
         print("This may cause failures if required tools are not installed.")
 
+    ensure_coverage_disk_space()
     args.func(args)
 
 

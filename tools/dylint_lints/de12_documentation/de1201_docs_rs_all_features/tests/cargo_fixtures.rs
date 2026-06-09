@@ -37,7 +37,6 @@ fn run_fixture_with_env(name: &str, extra_env: &[(&str, &str)]) -> Output {
     let fixture = fixtures_dir().join(name);
     let manifest_path = fixture.join("Cargo.toml");
     let lint_parent_dir = lint_parent_dir();
-    let target_dir = target_dir().join("de1201_cargo_fixtures").join(name);
 
     let mut command = Command::new("cargo");
     command
@@ -49,8 +48,7 @@ fn run_fixture_with_env(name: &str, extra_env: &[(&str, &str)]) -> Output {
         .arg("--manifest-path")
         .arg(&manifest_path)
         .arg("--no-deps")
-        .arg("--quiet")
-        .env("CARGO_TARGET_DIR", target_dir)
+        .env_remove("CARGO_TARGET_DIR")
         .env_remove(ENV_EXCLUDED_CRATES)
         .env_remove("DYLINT_RUSTFLAGS")
         .env_remove("DYLINT_TOML")
@@ -82,14 +80,6 @@ fn lint_parent_dir() -> PathBuf {
         .to_path_buf()
 }
 
-fn target_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("lint crate should be inside the Dylint workspace")
-        .join("target")
-}
-
 fn remove_fixture_lockfile(fixture: &Path) {
     match fs::remove_file(fixture.join("Cargo.lock")) {
         Ok(()) => {}
@@ -102,11 +92,25 @@ fn remove_fixture_lockfile(fixture: &Path) {
 }
 
 fn assert_success(name: &str, output: &Output) {
-    assert!(
-        output.status.success(),
-        "fixture `{name}` failed\nstdout:\n{}\nstderr:\n{}",
+    if output.status.success() {
+        return;
+    }
+
+    let toolchain = std::env::var("RUSTUP_TOOLCHAIN").unwrap_or_else(|_| "<unset>".into());
+    let has_dylint_link = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).any(|dir| dir.join("dylint-link").exists()))
+        .unwrap_or(false);
+
+    panic!(
+        "fixture `{name}` failed (exit code: {:?})\n\
+         --- diagnostics ---\n\
+         RUSTUP_TOOLCHAIN={toolchain}\n\
+         dylint-link in PATH: {has_dylint_link}\n\
+         --- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        output.status.code(),
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&output.stderr),
     );
 }
 
