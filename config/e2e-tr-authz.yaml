@@ -293,6 +293,47 @@ gears:
       file: "resource_group.db"
     config: {}
 
+  static-idp-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+  account-management:
+    database:
+      server: "sqlite_users"
+      file: "account_management.db"
+    config:
+      bootstrap:
+        # Matches static-tr-plugin's `e2e-root` so AM's tenants table
+        # ends up holding the same root id the platform middleware
+        # already knows about, letting E2E callers POST child tenants
+        # under it without a separate seeding step.
+        root_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+        root_name: "e2e-root"
+        root_tenant_type: "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
+        idp_wait_timeout: "5m"
+        idp_retry_backoff_initial: "2s"
+        idp_retry_backoff_max: "30s"
+        strict: false
+      idp:
+        # Must match static-idp-plugin's vendor so LazyIdpProvider
+        # resolves the plugin at bootstrap time. The IdpConfig default
+        # is "cf"; the E2E static-idp-plugin is configured with
+        # vendor "constructorfabric" (consistent with all other E2E plugins).
+        vendor: "constructorfabric"
+        # Fail-closed on missing IdP client: `static-idp-plugin` is
+        # enabled in this E2E config so the user-management surface
+        # (`/tenants/{id}/users`) MUST resolve to a live plugin, not
+        # the silent `NoopIdpProvider` fallback that returns 501. AM's
+        # `deps = [...]` does not name `static-idp-plugin` directly (AM
+        # is plugin-impl-agnostic), so without `idp.required=true` the
+        # ToolKit topo-sort could initialise AM before the plugin and
+        # leave it serving 501s for the lifetime of the process. With
+        # `required=true` AM aborts startup loud and fast if it can't
+        # see the plugin — the operator then knows to investigate
+        # rather than silently shipping a half-wired stack.
+        required: true
+
   simple-user-settings:
     # Gear-specific database configuration
     database:
