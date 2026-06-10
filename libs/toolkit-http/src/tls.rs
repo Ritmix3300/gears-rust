@@ -3,7 +3,8 @@
 //! This gear provides cached loading of native root certificates to avoid
 //! repeated OS certificate store lookups (which can be slow on some platforms).
 
-use rustls_pki_types::CertificateDer;
+use crate::config::{ClientAuthConfig, TlsConfig, TlsVersion};
+use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use std::sync::{Arc, OnceLock};
 
 /// Cached native root certificates.
@@ -206,7 +207,11 @@ mod fips_test_provider {
     });
 }
 
-/// Build a rustls `ClientConfig` from the given root store.
+/// Build a rustls `ClientConfig` from the given root store and [`TlsConfig`].
+///
+/// `tls.min_version` selects the advertised protocol versions (see
+/// [`protocol_versions`]) and `tls.client_auth`, when set, installs a
+/// mutual-TLS client certificate (see [`load_client_auth`]).
 ///
 /// Under the `fips` feature, applies [`apply_fips_hardening`] which:
 ///   1. forces `require_ems = true` (NIST SP 800-52 Rev. 2 §3.5), and
@@ -218,6 +223,7 @@ mod fips_test_provider {
 /// versions) that also affect `ClientConfig::fips()`.
 fn build_client_config(
     root_store: rustls::RootCertStore,
+    tls: &TlsConfig,
 ) -> Result<rustls::ClientConfig, TlsConfigError> {
     // Test-only: ensure the platform-appropriate FIPS crypto provider is
     // installed before this funnel runs. The fail-closed path below requires
@@ -247,12 +253,24 @@ fn build_client_config(
     #[cfg(not(feature = "fips"))]
     let provider = get_crypto_provider();
 
-    #[allow(unused_mut)]
-    let mut config = rustls::ClientConfig::builder_with_provider(provider)
-        .with_safe_default_protocol_versions()
+    let roots_builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(protocol_versions(tls.min_version))
         .map_err(|e| TlsConfigError::Other(Box::new(e)))?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+        .with_root_certificates(root_store);
+
+    // Plumb optional mutual-TLS client identity. PEM material is read and
+    // parsed here (not at config-construction time) so IO/parse failures
+    // surface as a recoverable `TlsConfigError` at client-build time.
+    #[allow(unused_mut)]
+    let mut config = match &tls.client_auth {
+        Some(auth) => {
+            let (cert_chain, key) = load_client_auth(auth)?;
+            roots_builder
+                .with_client_auth_cert(cert_chain, key)
+                .map_err(|e| TlsConfigError::Other(Box::new(e)))?
+        }
+        None => roots_builder.with_no_client_auth(),
+    };
 
     #[cfg(feature = "fips")]
     {
@@ -260,6 +278,72 @@ fn build_client_config(
     }
 
     Ok(config)
+}
+
+/// Map a [`TlsVersion`] floor onto the rustls protocol-version slice.
+///
+/// `Tls12` advertises both TLS 1.2 and TLS 1.3 (equivalent to the previous
+/// `with_safe_default_protocol_versions()`); `Tls13` advertises TLS 1.3 only.
+/// The returned slices are `const` items and therefore inherently `'static` —
+/// every element is a reference to a `rustls::version::*` static.
+fn protocol_versions(min: TlsVersion) -> &'static [&'static rustls::SupportedProtocolVersion] {
+    const TLS12_AND_13: &[&rustls::SupportedProtocolVersion] =
+        &[&rustls::version::TLS13, &rustls::version::TLS12];
+    const TLS13_ONLY: &[&rustls::SupportedProtocolVersion] = &[&rustls::version::TLS13];
+    match min {
+        TlsVersion::Tls12 => TLS12_AND_13,
+        TlsVersion::Tls13 => TLS13_ONLY,
+    }
+}
+
+/// Load a PEM-encoded client certificate chain and private key for mutual TLS.
+///
+/// Reads both files referenced by [`ClientAuthConfig`], returning a
+/// [`TlsConfigError::Other`] (boxed, with path context) on any IO or parse
+/// failure or when the certificate chain is empty.
+fn load_client_auth(
+    auth: &ClientAuthConfig,
+) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), TlsConfigError> {
+    // `pem_file_iter` reports file-open errors eagerly and per-section parse
+    // errors lazily from the iterator; map both to the same path-context error.
+    let cert_err = |e: rustls_pki_types::pem::Error| {
+        TlsConfigError::Other(
+            format!(
+                "failed to load client certificate chain from {}: {e}",
+                auth.cert_chain.display()
+            )
+            .into(),
+        )
+    };
+    let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&auth.cert_chain)
+        .map_err(cert_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(cert_err)?;
+
+    if cert_chain.is_empty() {
+        return Err(TlsConfigError::Other(
+            format!(
+                "client certificate chain at {} contained no certificates",
+                auth.cert_chain.display()
+            )
+            .into(),
+        ));
+    }
+
+    // Deliberately do NOT interpolate the underlying parse error here: it is
+    // produced from private-key bytes and must never reach logs. The path is
+    // safe to include and is sufficient to diagnose IO/format problems.
+    let key = PrivateKeyDer::from_pem_file(&auth.key).map_err(|_| {
+        TlsConfigError::Other(
+            format!(
+                "failed to load client private key from {} (IO or PEM parse error)",
+                auth.key.display()
+            )
+            .into(),
+        )
+    })?;
+
+    Ok((cert_chain, key))
 }
 
 /// Apply FIPS-mode hardening to a freshly-built `ClientConfig`:
@@ -299,7 +383,7 @@ fn apply_fips_hardening(cfg: &mut rustls::ClientConfig) -> Result<(), TlsConfigE
 ///
 /// This fail-fast behavior ensures TLS configuration errors are caught at client
 /// construction time rather than failing later during TLS handshakes.
-pub fn native_roots_client_config() -> Result<rustls::ClientConfig, TlsConfigError> {
+pub fn native_roots_client_config(tls: &TlsConfig) -> Result<rustls::ClientConfig, TlsConfigError> {
     let certs = native_root_certs();
 
     let mut root_store = rustls::RootCertStore::empty();
@@ -331,7 +415,7 @@ pub fn native_roots_client_config() -> Result<rustls::ClientConfig, TlsConfigErr
         ));
     }
 
-    build_client_config(root_store)
+    build_client_config(root_store, tls)
 }
 
 /// Build a rustls `ClientConfig` using Mozilla's webpki-roots trust anchors.
@@ -340,10 +424,10 @@ pub fn native_roots_client_config() -> Result<rustls::ClientConfig, TlsConfigErr
 /// [`build_client_config`]). This is the FIPS-conformant counterpart to the
 /// `hyper_rustls::HttpsConnectorBuilder::with_provider_and_webpki_roots`
 /// one-liner — we must build the config ourselves so we can flip the EMS bit.
-pub fn webpki_roots_client_config() -> Result<rustls::ClientConfig, TlsConfigError> {
+pub fn webpki_roots_client_config(tls: &TlsConfig) -> Result<rustls::ClientConfig, TlsConfigError> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    build_client_config(root_store)
+    build_client_config(root_store, tls)
 }
 
 #[cfg(test)]
@@ -393,7 +477,7 @@ mod tests {
         // Building client config succeeds if native roots are available
         // (which they should be on most CI/dev systems)
         // On systems without native certs, this returns Err (expected behavior)
-        let result = native_roots_client_config();
+        let result = native_roots_client_config(&TlsConfig::default());
 
         // Log the result for debugging in CI
         match &result {
@@ -425,7 +509,8 @@ mod tests {
     /// not control; replaced.)
     #[test]
     fn test_webpki_roots_client_config_builds() {
-        let cfg = webpki_roots_client_config().expect("webpki roots must always build");
+        let cfg = webpki_roots_client_config(&TlsConfig::default())
+            .expect("webpki roots must always build");
         let provider = cfg.crypto_provider();
         assert!(
             !provider.cipher_suites.is_empty(),
@@ -457,11 +542,153 @@ mod tests {
     #[test]
     #[cfg(feature = "fips")]
     fn fips_client_config_requires_ems_and_advertises_fips() {
-        let cfg = webpki_roots_client_config().expect("build under fips");
+        let cfg = webpki_roots_client_config(&TlsConfig::default()).expect("build under fips");
         assert!(cfg.require_ems, "fips build must set require_ems = true");
         assert!(
             cfg.fips(),
             "fips build must yield ClientConfig::fips() == true (full provider chain)"
         );
+    }
+
+    /// `protocol_versions` maps the `min_version` knob onto the rustls
+    /// protocol-version slice: `Tls12` advertises both 1.2 and 1.3 (the
+    /// previous `with_safe_default_protocol_versions()` behaviour) and `Tls13`
+    /// advertises 1.3 only.
+    #[test]
+    fn protocol_versions_maps_min_version() {
+        let v12 = protocol_versions(TlsVersion::Tls12);
+        assert_eq!(v12.len(), 2, "Tls12 floor must advertise TLS 1.2 and 1.3");
+        assert!(
+            v12.iter()
+                .any(|v| v.version == rustls::ProtocolVersion::TLSv1_2)
+        );
+        assert!(
+            v12.iter()
+                .any(|v| v.version == rustls::ProtocolVersion::TLSv1_3)
+        );
+
+        let v13 = protocol_versions(TlsVersion::Tls13);
+        assert_eq!(v13.len(), 1, "Tls13 floor must advertise TLS 1.3 only");
+        assert_eq!(v13[0].version, rustls::ProtocolVersion::TLSv1_3);
+    }
+
+    /// A `min_version: Tls13` config still builds a valid `ClientConfig`
+    /// through the public webpki entry point.
+    #[test]
+    fn webpki_client_config_builds_with_tls13_floor() {
+        let tls = TlsConfig {
+            min_version: TlsVersion::Tls13,
+            ..TlsConfig::default()
+        };
+        let cfg = webpki_roots_client_config(&tls).expect("tls 1.3 floor must build");
+        assert!(!cfg.crypto_provider().cipher_suites.is_empty());
+    }
+
+    /// A `client_auth` pointing at non-existent PEM files must fail closed at
+    /// build time with a `TlsConfigError` whose message names the missing path
+    /// — not panic, and not silently fall back to no-client-auth.
+    #[test]
+    fn client_auth_missing_files_errors() {
+        let tls = TlsConfig {
+            client_auth: Some(ClientAuthConfig::new(
+                "/nonexistent/toolkit-http/cert.pem",
+                "/nonexistent/toolkit-http/key.pem",
+            )),
+            ..TlsConfig::default()
+        };
+        let err =
+            webpki_roots_client_config(&tls).expect_err("missing client-auth files must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("client certificate chain") && msg.contains("cert.pem"),
+            "error should name the missing cert path, got: {msg}"
+        );
+    }
+
+    /// Generate a self-signed ECDSA P-256 / SHA-256 identity and write it to a
+    /// fresh temp directory as PEM. Returns the [`tempfile::TempDir`] (which the
+    /// caller must keep alive — dropping it removes the files, even on panic)
+    /// and a [`ClientAuthConfig`] pointing at the written cert-chain and key.
+    ///
+    /// ECDSA P-256 / SHA-256 is an explicitly FIPS-approved signature class, so
+    /// the same identity drives both the non-FIPS and FIPS code paths.
+    fn write_self_signed_identity() -> (tempfile::TempDir, ClientAuthConfig) {
+        use std::io::Write;
+
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("generate ECDSA P-256 key pair");
+        let cert = rcgen::CertificateParams::new(vec!["client.test".to_owned()])
+            .expect("certificate params")
+            .self_signed(&key_pair)
+            .expect("self-sign certificate");
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let cert_path = dir.path().join("client_cert.pem");
+        let key_path = dir.path().join("client_key.pem");
+
+        std::fs::File::create(&cert_path)
+            .and_then(|mut f| f.write_all(cert.pem().as_bytes()))
+            .expect("write cert pem");
+        std::fs::File::create(&key_path)
+            .and_then(|mut f| f.write_all(key_pair.serialize_pem().as_bytes()))
+            .expect("write key pem");
+
+        (dir, ClientAuthConfig::new(cert_path, key_path))
+    }
+
+    /// Happy-path mutual TLS: a freshly generated self-signed cert + key load
+    /// from PEM files and produce a `ClientConfig` carrying a client-auth
+    /// resolver. Gated off under `fips`; the FIPS path is pinned separately by
+    /// `client_auth_under_fips_fails_closed`.
+    #[test]
+    #[cfg(not(feature = "fips"))]
+    fn client_auth_pem_round_trips() {
+        // `_dir` keeps the temp directory (and its PEM files) alive for the
+        // duration of the test; it is removed on drop, even if an assert panics.
+        let (_dir, client_auth) = write_self_signed_identity();
+        let tls = TlsConfig {
+            client_auth: Some(client_auth),
+            ..TlsConfig::default()
+        };
+
+        let result = webpki_roots_client_config(&tls);
+        assert!(
+            result.is_ok(),
+            "client-auth config from valid PEM must build: {:?}",
+            result.err()
+        );
+    }
+
+    /// Mutual TLS under `--features fips` must fail *closed*, never panic. Both
+    /// outcomes below are FIPS-correct and which one occurs is provider-
+    /// dependent (macOS corecrypto / Windows CNG / Linux AWS-LC):
+    ///   * `Ok(cfg)` with `cfg.fips() == true` — the active provider witnessed
+    ///     the ECDSA P-256 client-auth signer as FIPS-approved; or
+    ///   * `Err(TlsConfigError::FipsHardeningFailed(_))` — `apply_fips_hardening`
+    ///     rejected a config it could not prove `ClientConfig::fips()` for.
+    ///
+    /// Any other result (panic, a different error variant, or `Ok` with
+    /// `fips() == false`) is a regression in the FIPS mTLS path.
+    #[test]
+    #[cfg(feature = "fips")]
+    fn client_auth_under_fips_fails_closed() {
+        let (_dir, client_auth) = write_self_signed_identity();
+        let tls = TlsConfig {
+            client_auth: Some(client_auth),
+            ..TlsConfig::default()
+        };
+
+        match webpki_roots_client_config(&tls) {
+            Ok(cfg) => assert!(
+                cfg.fips(),
+                "fips build returned Ok but ClientConfig::fips() == false: \
+                 an mTLS config slipped past the FIPS witness"
+            ),
+            // Acceptable: failed closed because fips() could not be proven.
+            Err(TlsConfigError::FipsHardeningFailed(_)) => {}
+            Err(other) => {
+                panic!("unexpected non-fail-closed error on fips mTLS path: {other}")
+            }
+        }
     }
 }

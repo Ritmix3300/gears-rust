@@ -1,5 +1,6 @@
 use crate::config::{
-    HttpClientConfig, RedirectConfig, RetryConfig, TlsRootConfig, TransportSecurity,
+    ClientAuthConfig, HttpClientConfig, RedirectConfig, RetryConfig, TlsConfig, TlsRootConfig,
+    TlsVersion, TransportSecurity,
 };
 use crate::error::HttpError;
 use crate::layers::{OtelLayer, RetryLayer, SecureRedirectPolicy, UserAgentLayer};
@@ -117,6 +118,54 @@ impl HttpClientBuilder {
             "deny_insecure_http() called - enforcing TLS for all connections"
         );
         self.config.transport = TransportSecurity::TlsOnly;
+        self
+    }
+
+    /// Set the TLS handshake configuration (minimum protocol version and
+    /// optional mutual-TLS client identity).
+    ///
+    /// Replaces the entire [`TlsConfig`]; use [`crate::config::TlsConfig`]'s
+    /// fields to set `min_version` and `client_auth`. The root-trust strategy
+    /// is configured separately via the `tls_roots` config field.
+    ///
+    /// Mutual-TLS PEM material referenced by `client_auth` is read and parsed
+    /// in [`HttpClientBuilder::build`]; IO/parse failures surface there as
+    /// [`HttpError::Tls`].
+    ///
+    /// [`HttpClientBuilder::build`]: crate::builder::HttpClientBuilder::build
+    #[must_use]
+    pub fn tls(mut self, tls: TlsConfig) -> Self {
+        self.config.tls = tls;
+        self
+    }
+
+    /// Set the minimum TLS protocol version, leaving the rest of the
+    /// [`TlsConfig`] (e.g. `client_auth`) untouched.
+    ///
+    /// Convenience shortcut for mutating `config.tls.min_version` without
+    /// rebuilding the whole [`TlsConfig`] via [`HttpClientBuilder::tls`].
+    ///
+    /// [`HttpClientBuilder::tls`]: crate::builder::HttpClientBuilder::tls
+    #[must_use]
+    pub fn tls_min_version(mut self, min_version: TlsVersion) -> Self {
+        self.config.tls.min_version = min_version;
+        self
+    }
+
+    /// Set the mutual-TLS client identity, leaving the rest of the
+    /// [`TlsConfig`] (e.g. `min_version`) untouched.
+    ///
+    /// Convenience shortcut for mutating `config.tls.client_auth` without
+    /// rebuilding the whole [`TlsConfig`] via [`HttpClientBuilder::tls`]. The
+    /// referenced PEM material is read and parsed in
+    /// [`HttpClientBuilder::build`]; IO/parse failures surface there as
+    /// [`HttpError::Tls`].
+    ///
+    /// [`HttpClientBuilder::tls`]: crate::builder::HttpClientBuilder::tls
+    /// [`HttpClientBuilder::build`]: crate::builder::HttpClientBuilder::build
+    #[must_use]
+    pub fn client_auth(mut self, client_auth: ClientAuthConfig) -> Self {
+        self.config.tls.client_auth = Some(client_auth);
         self
     }
 
@@ -272,7 +321,11 @@ impl HttpClientBuilder {
         let total_timeout = self.config.total_timeout;
 
         // Build the HTTPS connector (may fail for Native roots if no valid certs)
-        let https = build_https_connector(self.config.tls_roots, self.config.transport)?;
+        let https = build_https_connector(
+            self.config.tls_roots,
+            self.config.transport,
+            &self.config.tls,
+        )?;
 
         // Create the base hyper client with HTTP/2 support and connection pool settings
         let mut client_builder = Client::builder(TokioExecutor::new());
@@ -539,6 +592,7 @@ where
 fn build_https_connector(
     tls_roots: TlsRootConfig,
     transport: TransportSecurity,
+    tls: &TlsConfig,
 ) -> Result<HttpsConnector<HttpConnector>, HttpError> {
     let allow_http = transport == TransportSecurity::AllowInsecureHttp;
 
@@ -550,8 +604,8 @@ fn build_https_connector(
     // `Box<dyn Error + Send + Sync>` preserves the source chain via
     // `TlsConfigError`'s own `Error::source()` impl.
     let client_config = match tls_roots {
-        TlsRootConfig::WebPki => tls::webpki_roots_client_config(),
-        TlsRootConfig::Native => tls::native_roots_client_config(),
+        TlsRootConfig::WebPki => tls::webpki_roots_client_config(tls),
+        TlsRootConfig::Native => tls::native_roots_client_config(tls),
     }
     .map_err(|e| HttpError::Tls(Box::new(e)))?;
 

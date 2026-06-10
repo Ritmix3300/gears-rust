@@ -57,7 +57,7 @@ hyper-rustls = { workspace = true }
 rustls = { workspace = true }
 webpki-roots = "1.0"
 rustls-native-certs = { workspace = true }
-rustls-pki-types = { workspace = true }
+rustls-pki-types = { workspace = true, features = ["std"] }
 http-body-util = { workspace = true }
 http-body = { workspace = true }
 bytes = { workspace = true }
@@ -97,6 +97,8 @@ rustls-cng-crypto = { workspace = true, optional = true }
 
 [dev-dependencies]
 httpmock = { workspace = true }
+rcgen = { workspace = true }
+tempfile = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 tracing-subscriber = { workspace = true }
 flate2 = { workspace = true }

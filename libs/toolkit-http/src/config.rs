@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Default User-Agent string for HTTP requests
@@ -505,8 +506,77 @@ const DEFAULT_TRANSPORT: TransportSecurity = TransportSecurity::TlsOnly;
 #[cfg(not(feature = "fips"))]
 const DEFAULT_TRANSPORT: TransportSecurity = TransportSecurity::AllowInsecureHttp;
 
+/// Minimum TLS protocol version the client will negotiate.
+///
+/// Maps onto the rustls protocol-version slice passed to
+/// `ClientConfig::builder_with_provider(..).with_protocol_versions(..)`:
+/// - [`TlsVersion::Tls12`] advertises both TLS 1.2 and TLS 1.3 (the historical
+///   `with_safe_default_protocol_versions()` behaviour).
+/// - [`TlsVersion::Tls13`] advertises TLS 1.3 only.
+///
+/// This is a *user* knob; it does not relax FIPS hardening. Under
+/// `--features fips`, `tls::apply_fips_hardening` still asserts
+/// `ClientConfig::fips()`, so a version selection incompatible with the active
+/// FIPS provider surfaces as a [`crate::error::HttpError::Tls`] at build time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TlsVersion {
+    /// Allow TLS 1.2 and TLS 1.3 (default — matches rustls safe defaults).
+    #[default]
+    Tls12,
+    /// Require TLS 1.3; reject TLS 1.2 handshakes.
+    Tls13,
+}
+
+/// Client-certificate (mutual TLS) identity.
+///
+/// Holds filesystem paths to PEM-encoded material rather than parsed key bytes
+/// so that [`HttpClientConfig`] stays cheaply `Clone`/`Debug` and no private-key
+/// bytes are held in the config. The files are read and parsed lazily in
+/// [`HttpClientBuilder::build`]; IO or parse failures are reported as
+/// [`crate::error::HttpError::Tls`].
+///
+/// [`HttpClientBuilder::build`]: crate::builder::HttpClientBuilder::build
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ClientAuthConfig {
+    /// Path to a PEM file containing the client certificate chain
+    /// (leaf first, then intermediates).
+    pub cert_chain: PathBuf,
+    /// Path to a PEM file containing the client private key
+    /// (PKCS#8, PKCS#1/RSA, or SEC1/EC).
+    pub key: PathBuf,
+}
+
+impl ClientAuthConfig {
+    /// Construct a mutual-TLS identity from PEM cert-chain and key file paths.
+    #[must_use]
+    pub fn new(cert_chain: impl Into<PathBuf>, key: impl Into<PathBuf>) -> Self {
+        Self {
+            cert_chain: cert_chain.into(),
+            key: key.into(),
+        }
+    }
+}
+
+/// TLS handshake configuration for the HTTP client.
+///
+/// Carries knobs that shape the rustls `ClientConfig` beyond the root-trust
+/// strategy (which lives in [`TlsRootConfig`]):
+/// - [`TlsConfig::min_version`] — minimum negotiated protocol version.
+/// - [`TlsConfig::client_auth`] — optional mutual-TLS client identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TlsConfig {
+    /// Minimum TLS protocol version (default: [`TlsVersion::Tls12`]).
+    pub min_version: TlsVersion,
+    /// Optional client-certificate identity for mutual TLS (default: `None`).
+    pub client_auth: Option<ClientAuthConfig>,
+}
+
 /// Overall HTTP client configuration
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct HttpClientConfig {
     /// Per-request timeout (default: 30 seconds)
     ///
@@ -551,6 +621,11 @@ pub struct HttpClientConfig {
 
     /// TLS root certificate strategy (default: `WebPki`)
     pub tls_roots: TlsRootConfig,
+
+    /// TLS handshake configuration: minimum protocol version and optional
+    /// mutual-TLS client identity (default: [`TlsConfig::default`] — TLS 1.2
+    /// floor, no client auth).
+    pub tls: TlsConfig,
 
     /// Enable OpenTelemetry tracing layer (default: false)
     /// Creates spans for outbound requests and injects trace context headers.
@@ -607,6 +682,7 @@ impl Default for HttpClientConfig {
             rate_limit: Some(RateLimitConfig::default()),
             transport: DEFAULT_TRANSPORT,
             tls_roots: TlsRootConfig::default(),
+            tls: TlsConfig::default(),
             otel: false,
             buffer_capacity: 1024,
             redirect: RedirectConfig::default(),
@@ -629,6 +705,7 @@ impl HttpClientConfig {
             rate_limit: None,
             transport: DEFAULT_TRANSPORT,
             tls_roots: TlsRootConfig::default(),
+            tls: TlsConfig::default(),
             otel: false,
             buffer_capacity: 256,
             redirect: RedirectConfig::default(),
@@ -649,6 +726,7 @@ impl HttpClientConfig {
             rate_limit: Some(RateLimitConfig::default()),
             transport: DEFAULT_TRANSPORT,
             tls_roots: TlsRootConfig::default(),
+            tls: TlsConfig::default(),
             otel: false,
             buffer_capacity: 1024,
             redirect: RedirectConfig::default(),
@@ -690,6 +768,7 @@ impl HttpClientConfig {
             rate_limit: Some(RateLimitConfig::conservative()),
             transport: DEFAULT_TRANSPORT,
             tls_roots: TlsRootConfig::default(),
+            tls: TlsConfig::default(),
             otel: false,
             buffer_capacity: 256,
             redirect: RedirectConfig::default(),
@@ -723,6 +802,7 @@ impl HttpClientConfig {
             rate_limit: None,
             transport: TransportSecurity::AllowInsecureHttp,
             tls_roots: TlsRootConfig::default(),
+            tls: TlsConfig::default(),
             otel: false,
             buffer_capacity: 256,
             redirect: RedirectConfig::for_testing(),
@@ -782,6 +862,7 @@ impl HttpClientConfig {
             rate_limit: None,
             transport: DEFAULT_TRANSPORT,
             tls_roots: TlsRootConfig::default(),
+            tls: TlsConfig::default(),
             otel: false,
             buffer_capacity: 64,
             redirect: RedirectConfig::default(),
@@ -1020,6 +1101,9 @@ mod tests {
         assert_eq!(config.transport, TransportSecurity::AllowInsecureHttp);
         #[cfg(feature = "fips")]
         assert_eq!(config.transport, TransportSecurity::TlsOnly);
+        // TLS knobs default to a TLS 1.2 floor with no mutual-TLS identity.
+        assert_eq!(config.tls.min_version, TlsVersion::Tls12);
+        assert!(config.tls.client_auth.is_none());
         assert!(!config.otel);
         assert_eq!(config.buffer_capacity, 1024);
     }
