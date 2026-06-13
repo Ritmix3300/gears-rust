@@ -73,6 +73,11 @@ pub struct JwtClaims {
     /// Scopes (space-separated).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+    /// Any non-standard claims, preserved verbatim so claim mapping can be
+    /// configured to read them by name (e.g. cap tokens' `subject_tenant`,
+    /// `scopes`). An empty map serializes to nothing.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// JWT validator backed by a domain JWKS provider port.
