@@ -28,7 +28,7 @@ use crate::api::rest::dto::{
     CreateSessionRequestDto, ExportAcceptedDto, MessageDto, MessageListDto, ReactionListDto,
     ReactionRequestDto, RecreateMessageRequestDto, SearchRequestDto, SearchResultsDto,
     SendMessageRequestDto, SessionDto, ShareRequestDto, ShareResponseDto, SharedSessionDto,
-    StreamingEventDto, SummarizeAcceptedDto, SwitchSessionTypeRequestDto, VariantListDto,
+    StreamingEventDto, SwitchSessionTypeRequestDto, VariantListDto,
 };
 use crate::api::rest::handlers;
 use crate::domain::service::{
@@ -278,10 +278,10 @@ pub fn register_routes(
         .require_license_features([&ChatEngineLicense])
         .path_param("id", "Session UUID")
         .handler(handlers::glue::summarize_session)
-        .json_response_with_schema::<SummarizeAcceptedDto>(
+        .json_response_with_schema::<StreamingEventDto>(
             openapi,
-            StatusCode::ACCEPTED,
-            "Summary accepted (use status URL to poll)",
+            StatusCode::OK,
+            "NDJSON stream of StreamingEventDto (application/x-ndjson)",
         )
         .standard_errors(openapi)
         .register(router, openapi);
@@ -373,7 +373,7 @@ pub fn register_routes(
         .authenticated()
         .require_license_features([&ChatEngineLicense])
         .path_param("id", "Message UUID")
-        .handler(handlers::variants::list_variants)
+        .handler(handlers::glue::list_variants)
         .json_response_with_schema::<VariantListDto>(openapi, StatusCode::OK, "Variant list")
         .standard_errors(openapi)
         .register(router, openapi);

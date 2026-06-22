@@ -1,35 +1,38 @@
-//! Phase 14 glue handlers for routes whose underlying service surface
-//! is not yet exposed by Phases 4-12.
+//! Glue handlers bridging the spec's `message_id`-only / path-`session_id`
+//! routes to the session-scoped domain services.
 //!
-//! These handlers are deliberately minimal — they exist so the route
-//! table declared in `api/rest/routes` is complete and the crate
-//! compiles end-to-end. The full implementations land in Phase 15 (where
-//! they can be wired through the production services with proper
-//! `tenant_id` / `user_id` scoping) and the E2E suite in Phase 16
-//! exercises them against the wire contract.
+//! The HTTP spec keys several routes on `message_id` alone
+//! (`GET /messages/{id}`, recreate, reactions, variants) while the domain
+//! services are session-scoped. These handlers resolve the owning
+//! `session_id` via [`MessageService::resolve_owned_message`] (which also
+//! performs the tenant/user ownership check, folding cross-tenant misses to
+//! 404) and then delegate to the appropriate service.
 //
 // @cpt-cf-chat-engine-api-rest-handlers-glue:p14
 
 use std::sync::Arc;
 
 use axum::extract::{Path, Query};
+use axum::response::Response;
 use axum::{Extension, Json};
+use chat_engine_sdk::models::CapabilityValue;
 use serde::Deserialize;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use toolkit_security::SecurityContext;
 
-use axum::response::Response;
-use futures::stream;
-
 use crate::api::rest::dto::{
-    MessageDto, MessageListDto, ReactionListDto, ReactionRequestDto, RecreateMessageRequestDto,
-    SearchRequestDto, SearchResultsDto, StreamingEventDto, SummarizeAcceptedDto,
+    MessageDto, MessageListDto, ReactionDto, ReactionListDto, ReactionRequestDto,
+    RecreateMessageRequestDto, SearchRequestDto, SearchResultsDto, SendMessageRequestDto,
+    VariantInfoDto, VariantListDto, parts_into_sdk,
 };
 use crate::api::rest::handlers::sessions::identity_from_ctx;
-use crate::api::rest::ndjson_response;
+use crate::api::rest::ndjson_stream_response;
 use crate::domain::error::{ChatEngineError, Result};
+use crate::domain::reaction::ReactionType;
 use crate::domain::search::SearchQuery;
+use crate::domain::service::message_service::SendMessageRequest;
 use crate::domain::service::{
     IntelligenceService, MessageService, ReactionService, SearchService, VariantService,
 };
@@ -41,57 +44,179 @@ pub struct ListMessagesQuery {
     pub parent_message_id: Option<Uuid>,
 }
 
-/// `GET /chat-engine/v1/sessions/{id}/messages` — Phase 14 stub.
-///
-/// Phase 15 wires this to a `MessageService::list_messages(session_id,
-/// parent_message_id)` call once the corresponding repository method is
-/// added. For Phase 14 the handler validates the auth context, returns
-/// an empty envelope, and emits a `tracing` breadcrumb so the operator
-/// can see the placeholder was hit.
-#[tracing::instrument(
-    skip(svc, ctx),
-    fields(session_id = %session_id, parent_message_id),
-)]
+/// Map optional wire capability values onto the SDK type.
+fn capabilities_into_sdk(
+    caps: Option<Vec<crate::api::rest::dto::CapabilityValueDto>>,
+) -> Option<Vec<CapabilityValue>> {
+    caps.map(|c| c.into_iter().map(CapabilityValue::from).collect())
+}
+
+/// `POST /chat-engine/v1/sessions/{id}/messages` — send a user message and
+/// stream the assistant response as NDJSON.
+#[tracing::instrument(skip(svc, ctx, body), fields(session_id = %session_id))]
+pub async fn send_message_in_session(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<MessageService>>,
+    Path(session_id): Path<Uuid>,
+    Json(body): Json<SendMessageRequestDto>,
+) -> Result<Response> {
+    let identity = identity_from_ctx(&ctx)?;
+    let req = SendMessageRequest {
+        session_id,
+        parts: parts_into_sdk(body.parts),
+        file_ids: body.file_ids.unwrap_or_default(),
+        parent_message_id: body.parent_message_id,
+        capabilities: capabilities_into_sdk(body.capabilities),
+    };
+    let cancel = CancellationToken::new();
+    let stream = svc.send_message(req, identity, cancel.clone()).await?;
+    Ok(ndjson_stream_response(stream, cancel))
+}
+
+/// `GET /chat-engine/v1/sessions/{id}/messages` — list the active path.
+#[tracing::instrument(skip(svc, ctx, query), fields(session_id = %session_id))]
 pub async fn list_messages(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<MessageService>>,
     Path(session_id): Path<Uuid>,
     Query(query): Query<ListMessagesQuery>,
 ) -> Result<Json<MessageListDto>> {
-    let _identity = identity_from_ctx(&ctx)?;
-    let _ = (svc, query);
-    tracing::debug!(
-        %session_id,
-        "list_messages glue handler hit (Phase 15 will land the full implementation)",
-    );
-    Ok(Json(MessageListDto { items: vec![] }))
+    let identity = identity_from_ctx(&ctx)?;
+    let messages = svc
+        .list_active_messages(&identity, session_id, query.parent_message_id)
+        .await?;
+    Ok(Json(MessageListDto {
+        items: messages.into_iter().map(MessageDto::from).collect(),
+    }))
 }
 
-/// `GET /chat-engine/v1/messages/{id}` — Phase 14 stub.
-///
-/// Phase 15 wires this to a tenant-scoped lookup on the message repo.
-#[tracing::instrument(
-    skip(svc, ctx),
-    fields(message_id = %message_id),
-)]
+/// `GET /chat-engine/v1/messages/{id}` — fetch a single owned message.
+#[tracing::instrument(skip(svc, ctx), fields(message_id = %message_id))]
 pub async fn get_message(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<MessageService>>,
     Path(message_id): Path<Uuid>,
 ) -> Result<Json<MessageDto>> {
-    let _identity = identity_from_ctx(&ctx)?;
-    let _ = svc;
-    Err(ChatEngineError::not_found("message", message_id))
+    let identity = identity_from_ctx(&ctx)?;
+    let message = svc.resolve_owned_message(&identity, message_id).await?;
+    Ok(Json(MessageDto::from(message)))
+}
+
+/// `POST /chat-engine/v1/messages/{id}/recreate` — regenerate an assistant
+/// variant, streaming the new response as NDJSON.
+#[tracing::instrument(skip(messages, variants, ctx, body), fields(message_id = %message_id))]
+pub async fn recreate_message(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(messages): Extension<Arc<MessageService>>,
+    Extension(variants): Extension<Arc<VariantService>>,
+    Path(message_id): Path<Uuid>,
+    Json(body): Json<RecreateMessageRequestDto>,
+) -> Result<Response> {
+    let identity = identity_from_ctx(&ctx)?;
+    let session_id = messages
+        .resolve_owned_message(&identity, message_id)
+        .await?
+        .session_id;
+    let cancel = CancellationToken::new();
+    let stream = variants
+        .recreate_variant(
+            &identity,
+            session_id,
+            message_id,
+            capabilities_into_sdk(body.enabled_capabilities),
+            cancel.clone(),
+        )
+        .await?;
+    Ok(ndjson_stream_response(stream, cancel))
+}
+
+/// `GET /chat-engine/v1/messages/{id}/variants` — list sibling variants.
+#[tracing::instrument(skip(messages, variants, ctx), fields(message_id = %message_id))]
+pub async fn list_variants(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(messages): Extension<Arc<MessageService>>,
+    Extension(variants): Extension<Arc<VariantService>>,
+    Path(message_id): Path<Uuid>,
+) -> Result<Json<VariantListDto>> {
+    let identity = identity_from_ctx(&ctx)?;
+    let session_id = messages
+        .resolve_owned_message(&identity, message_id)
+        .await?
+        .session_id;
+    let listing = variants
+        .list_variants(&identity, session_id, message_id)
+        .await?;
+    Ok(Json(VariantListDto {
+        current_index: listing.current_index,
+        variants: listing
+            .variants
+            .into_iter()
+            .map(|e| VariantInfoDto::from(e.info))
+            .collect(),
+    }))
+}
+
+/// `POST /chat-engine/v1/messages/{id}/reactions` — set/update a reaction.
+#[tracing::instrument(skip(messages, reactions, ctx, body), fields(message_id = %message_id))]
+pub async fn set_reaction(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(messages): Extension<Arc<MessageService>>,
+    Extension(reactions): Extension<Arc<ReactionService>>,
+    Path(message_id): Path<Uuid>,
+    Json(body): Json<ReactionRequestDto>,
+) -> Result<Json<ReactionListDto>> {
+    let identity = identity_from_ctx(&ctx)?;
+    let reaction_type = ReactionType::from_str_value(&body.kind).ok_or_else(|| {
+        ChatEngineError::bad_request(format!("unknown reaction kind: {}", body.kind))
+    })?;
+    let session_id = messages
+        .resolve_owned_message(&identity, message_id)
+        .await?
+        .session_id;
+
+    let (_response, mutation) = reactions
+        .set_reaction(&identity, session_id, message_id, reaction_type)
+        .await?;
+    // Notify the backend plugin out-of-band; the detached task logs failures
+    // and never blocks the HTTP response (see `spawn_plugin_notification`).
+    drop(reactions.spawn_plugin_notification(mutation));
+
+    let listing = reactions
+        .list_reactions(&identity, session_id, message_id)
+        .await?;
+    Ok(Json(ReactionListDto {
+        reactions: listing
+            .reactions
+            .into_iter()
+            .map(|r| ReactionDto {
+                kind: r.reaction_type.as_str().to_string(),
+                value: None,
+                user_id: r.user_id,
+                created_at: r.created_at,
+            })
+            .collect(),
+    }))
+}
+
+/// `POST /chat-engine/v1/sessions/{id}/summarize` — trigger an on-demand
+/// session summary, streaming progress + the persisted summary as NDJSON.
+#[tracing::instrument(skip(svc, ctx), fields(session_id = %session_id))]
+pub async fn summarize_session(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<IntelligenceService>>,
+    Path(session_id): Path<Uuid>,
+) -> Result<Response> {
+    let identity = identity_from_ctx(&ctx)?;
+    let cancel = CancellationToken::new();
+    let stream = svc
+        .summarize_session(&identity, session_id, cancel.clone())
+        .await?;
+    Ok(ndjson_stream_response(stream, cancel))
 }
 
 /// `POST /chat-engine/v1/sessions/{id}/search` — JSON-body variant that
-/// delegates to [`SearchService::search_in_session`]. Bridges the
-/// HTTP spec (POST with body) to the Phase 11 handler's GET-with-query
-/// signature.
-#[tracing::instrument(
-    skip(svc, ctx, body),
-    fields(session_id = %session_id, query_length),
-)]
+/// delegates to [`SearchService::search_in_session`].
+#[tracing::instrument(skip(svc, ctx, body), fields(session_id = %session_id, query_length))]
 pub async fn search_in_session(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<SearchService>>,
@@ -114,8 +239,7 @@ pub async fn search_in_session(
     Ok(Json(SearchResultsDto { results }))
 }
 
-/// `POST /chat-engine/v1/sessions/search` — cross-session JSON-body
-/// variant of the search endpoint.
+/// `POST /chat-engine/v1/sessions/search` — cross-session JSON-body variant.
 #[tracing::instrument(skip(svc, ctx, body), fields(query_length))]
 pub async fn search_across_sessions(
     Extension(ctx): Extension<SecurityContext>,
@@ -136,105 +260,4 @@ pub async fn search_across_sessions(
         .filter_map(|hit| serde_json::to_value(hit).ok())
         .collect();
     Ok(Json(SearchResultsDto { results }))
-}
-
-/// `POST /chat-engine/v1/sessions/{id}/messages` — Phase 14 stub for the
-/// path-parameterised variant of [`super::messages::send_message`].
-///
-/// The Phase 5 handler accepts `session_id` from the request body; the API
-/// spec sources it from the path. Phase 15 will collapse the two so this
-/// stub goes away. For Phase 14 we close the stream cleanly so the wire
-/// contract remains testable.
-#[tracing::instrument(
-    skip(svc, ctx, body),
-    fields(session_id = %session_id),
-)]
-pub async fn send_message_in_session(
-    Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<MessageService>>,
-    Path(session_id): Path<Uuid>,
-    Json(body): Json<crate::api::rest::dto::SendMessageRequestDto>,
-) -> Result<Response> {
-    let _identity = identity_from_ctx(&ctx)?;
-    let _ = (svc, body, session_id);
-    tracing::debug!(
-        %session_id,
-        "send_message_in_session glue handler hit (Phase 15 will land the full implementation)",
-    );
-    let empty = stream::empty::<std::result::Result<StreamingEventDto, ChatEngineError>>();
-    Ok(ndjson_response(empty))
-}
-
-/// `POST /chat-engine/v1/messages/{id}/recreate` — Phase 14 stub.
-///
-/// The Phase 6 [`VariantService::recreate_variant`] handler is bound to a
-/// `(session_id, message_id)` path; the API spec only carries `message_id`.
-/// Phase 15 lands the service-side lookup. For Phase 14 this stub closes
-/// the stream cleanly so the wire contract is testable end-to-end.
-#[tracing::instrument(
-    skip(svc, ctx, body),
-    fields(message_id = %message_id),
-)]
-pub async fn recreate_message(
-    Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<VariantService>>,
-    Path(message_id): Path<Uuid>,
-    Json(body): Json<RecreateMessageRequestDto>,
-) -> Result<Response> {
-    let _identity = identity_from_ctx(&ctx)?;
-    let _ = (svc, body, message_id);
-    tracing::debug!(
-        %message_id,
-        "recreate_message glue handler hit (Phase 15 will land the full implementation)",
-    );
-    let empty = stream::empty::<std::result::Result<StreamingEventDto, ChatEngineError>>();
-    Ok(ndjson_response(empty))
-}
-
-/// `POST /chat-engine/v1/messages/{id}/reactions` — Phase 14 stub.
-///
-/// The Phase 9 handler requires both `session_id` and `message_id` on the
-/// path; the API spec only carries `message_id`. Phase 15 will land the
-/// service-side lookup that resolves the parent `session_id` from
-/// `message_id` so the handler can delegate to `ReactionService::set_reaction`
-/// without a round-trip. For Phase 14 this stub validates the auth context
-/// and returns an empty reaction list.
-#[tracing::instrument(
-    skip(svc, ctx, body),
-    fields(message_id = %message_id),
-)]
-pub async fn set_reaction(
-    Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<ReactionService>>,
-    Path(message_id): Path<Uuid>,
-    Json(body): Json<ReactionRequestDto>,
-) -> Result<Json<ReactionListDto>> {
-    let _identity = identity_from_ctx(&ctx)?;
-    let _ = (svc, body);
-    tracing::debug!(
-        %message_id,
-        "set_reaction glue handler hit (Phase 15 will land the session-id resolution)",
-    );
-    Ok(Json(ReactionListDto { reactions: vec![] }))
-}
-
-/// `POST /chat-engine/v1/sessions/{id}/summarize` — Phase 14 stub.
-///
-/// Phase 15 wires the synchronous accept path that schedules the
-/// async summarization task and returns the polling URL.
-#[tracing::instrument(
-    skip(svc, ctx),
-    fields(session_id = %session_id),
-)]
-pub async fn summarize_session(
-    Extension(ctx): Extension<SecurityContext>,
-    Extension(svc): Extension<Arc<IntelligenceService>>,
-    Path(session_id): Path<Uuid>,
-) -> Result<Json<SummarizeAcceptedDto>> {
-    let _identity = identity_from_ctx(&ctx)?;
-    let _ = svc;
-    Ok(Json(SummarizeAcceptedDto {
-        session_id,
-        status_url: format!("/chat-engine/v1/sessions/{session_id}/summarize/status"),
-    }))
 }

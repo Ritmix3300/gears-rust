@@ -195,6 +195,23 @@ pub trait MessageRepo: Send + Sync {
         message_id: Uuid,
     ) -> Result<Option<Message>, ChatEngineError>;
 
+    /// Look up a single message by id alone (no session scope) — used by the
+    /// REST routes keyed on `message_id` only to resolve the owning
+    /// `session_id` before delegating to session-scoped service methods. The
+    /// caller is responsible for the subsequent ownership check.
+    ///
+    /// Default impl returns `Internal` so existing test mocks compile; the
+    /// Sea-ORM impl overrides this.
+    async fn find_message_by_id(
+        &self,
+        message_id: Uuid,
+    ) -> Result<Option<Message>, ChatEngineError> {
+        let _ = message_id;
+        Err(ChatEngineError::internal(
+            "find_message_by_id not implemented for this repository",
+        ))
+    }
+
     /// Phase 7 hook (context management). Return the *raw* active path for a
     /// session — every message with `is_active=true AND is_complete=true`
     /// ordered by `created_at ASC`. Unlike [`Self::fetch_active_history`],
@@ -684,6 +701,24 @@ impl MessageRepo for SeaMessageRepo {
                 .attach_parts(vec![Message::from(row)])
                 .await?
                 .pop()),
+            None => Ok(None),
+        }
+    }
+
+    async fn find_message_by_id(
+        &self,
+        message_id: Uuid,
+    ) -> Result<Option<Message>, ChatEngineError> {
+        let conn = self.db.conn()?;
+        let scope = AccessScope::allow_all();
+        let row = MessageEntity::find()
+            .secure()
+            .scope_with(&scope)
+            .filter(Condition::all().add(message_entity::Column::MessageId.eq(message_id)))
+            .one(&conn)
+            .await?;
+        match row {
+            Some(row) => Ok(self.attach_parts(vec![Message::from(row)]).await?.pop()),
             None => Ok(None),
         }
     }

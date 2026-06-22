@@ -202,6 +202,52 @@ impl MessageService {
         self
     }
 
+    /// Resolve a message by id and verify the caller owns its session,
+    /// returning the message. Cross-tenant / unknown ids fold to a 404
+    /// `message` not-found (anti-enumeration, ADR-0021). Used by the REST
+    /// routes keyed on `message_id` only (`GET /messages/{id}`, recreate,
+    /// reactions, variants) to both serve the message and resolve the
+    /// owning `session_id` for session-scoped delegation.
+    pub async fn resolve_owned_message(
+        &self,
+        identity: &Identity,
+        message_id: Uuid,
+    ) -> Result<Message> {
+        let message = self
+            .messages
+            .find_message_by_id(message_id)
+            .await?
+            .ok_or_else(|| ChatEngineError::not_found("message", message_id))?;
+        self.sessions
+            .find_by_id(&identity.tenant_id, &identity.user_id, message.session_id)
+            .await?
+            .ok_or_else(|| ChatEngineError::not_found("message", message_id))?;
+        Ok(message)
+    }
+
+    /// List the active, visible conversation path of a session in
+    /// chronological order (ownership-checked). When `parent_message_id` is
+    /// supplied, only the direct replies under that node are returned.
+    pub async fn list_active_messages(
+        &self,
+        identity: &Identity,
+        session_id: Uuid,
+        parent_message_id: Option<Uuid>,
+    ) -> Result<Vec<Message>> {
+        self.sessions
+            .find_by_id(&identity.tenant_id, &identity.user_id, session_id)
+            .await?
+            .ok_or_else(|| ChatEngineError::not_found("session", session_id))?;
+        let messages = self.messages.fetch_active_history(session_id, None).await?;
+        Ok(match parent_message_id {
+            Some(pid) => messages
+                .into_iter()
+                .filter(|m| m.parent_message_id == Some(pid))
+                .collect(),
+            None => messages,
+        })
+    }
+
     /// Process a new user message and return an NDJSON-ready
     /// `StreamingEvent` stream.
     ///

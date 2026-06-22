@@ -236,7 +236,7 @@ impl DeleteMessageResponse {
 #[tracing::instrument(
     skip(svc, ctx),
     fields(
-        session_id = %session_id,
+        session_id = Empty,
         message_id = %message_id,
         request_id = Empty,
     ),
@@ -244,9 +244,16 @@ impl DeleteMessageResponse {
 pub async fn delete_message(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<MessageService>>,
-    Path((session_id, message_id)): Path<(Uuid, Uuid)>,
+    Path(message_id): Path<Uuid>,
 ) -> Result<Json<DeleteMessageResponse>> {
     let identity = identity_from_ctx(&ctx)?;
+    // The spec keys this route on `message_id` only; resolve the owning
+    // session (ownership-checked, cross-tenant → 404) before the cascade.
+    let session_id = svc
+        .resolve_owned_message(&identity, message_id)
+        .await?
+        .session_id;
+    tracing::Span::current().record("session_id", tracing::field::display(session_id));
     let outcome = svc
         .delete_message_cascade(&identity, session_id, message_id)
         .await?;
