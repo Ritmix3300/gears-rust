@@ -95,6 +95,38 @@ pub enum WireStreamEvent {
         path: String,
         value: JsonValue,
     },
+    /// Transient progress indicator (not a document mutation; carries bespoke
+    /// `code`/`detail` rather than `op`/`path`/`value`).
+    #[serde(rename = "message.status.changed")]
+    StatusChanged {
+        message_id: Uuid,
+        seq: u64,
+        code: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// Opaque assistant-message state patch (merged into message metadata).
+    #[serde(rename = "message.state.changed")]
+    StateChanged {
+        message_id: Uuid,
+        seq: u64,
+        state: JsonValue,
+    },
+    /// Session-scoped metadata patch (merged into the owning session).
+    #[serde(rename = "session.meta.updated")]
+    SessionMetaUpdated {
+        message_id: Uuid,
+        seq: u64,
+        patch: JsonValue,
+    },
+    /// Tool-invocation trace (recorded in message metadata).
+    #[serde(rename = "message.tool")]
+    Tool {
+        message_id: Uuid,
+        seq: u64,
+        tool: String,
+        payload: JsonValue,
+    },
     /// Successful end; carries optional plugin metadata. Terminal.
     #[serde(rename = "message.complete")]
     Complete {
@@ -123,6 +155,10 @@ impl WireStreamEvent {
             | WireStreamEvent::FileCitationAdd { seq, .. }
             | WireStreamEvent::LinkCitationAdd { seq, .. }
             | WireStreamEvent::ReferenceAdd { seq, .. }
+            | WireStreamEvent::StatusChanged { seq, .. }
+            | WireStreamEvent::StateChanged { seq, .. }
+            | WireStreamEvent::SessionMetaUpdated { seq, .. }
+            | WireStreamEvent::Tool { seq, .. }
             | WireStreamEvent::Complete { seq, .. }
             | WireStreamEvent::Error { seq, .. } => *seq,
         }
@@ -139,6 +175,10 @@ impl WireStreamEvent {
             WireStreamEvent::FileCitationAdd { .. } => "message.file_citation.add",
             WireStreamEvent::LinkCitationAdd { .. } => "message.link_citation.add",
             WireStreamEvent::ReferenceAdd { .. } => "message.reference.add",
+            WireStreamEvent::StatusChanged { .. } => "message.status.changed",
+            WireStreamEvent::StateChanged { .. } => "message.state.changed",
+            WireStreamEvent::SessionMetaUpdated { .. } => "session.meta.updated",
+            WireStreamEvent::Tool { .. } => "message.tool",
             WireStreamEvent::Complete { .. } => "message.complete",
             WireStreamEvent::Error { .. } => "message.error",
         }
@@ -154,22 +194,22 @@ impl WireStreamEvent {
     }
 }
 
-/// Path of the assistant's primary text part body (tokens append here).
-const TEXT_BODY_PATH: &str = "parts/0/content/text";
-/// Path of the assistant's primary text part (opened with `add`).
-const TEXT_PART_PATH: &str = "parts/0";
-
 /// Stateful projector: feed it the plugin's [`StreamingEvent`]s in order and it
 /// yields the client-facing [`WireStreamEvent`]s, assigning a monotonic `seq`.
 ///
-/// The assistant answer accumulates into a single `text` part at `parts/0`:
-/// the first chunk opens the part (`add parts/0`), subsequent chunks append to
-/// `parts/0/content/text`. Citations/references on `Complete` are appended to
-/// the part's arrays as `delta`s before the terminal `complete`.
+/// Text accumulates into the primary `text` part (opened lazily on the first
+/// chunk via `message.part.add`, then `message.text.delta` appends). Discrete
+/// `Part` events open further parts at the next index. Out-of-band events
+/// (status / state / session-meta / tool) project to their own typed events and
+/// do not mutate the document.
 pub struct DeltaProjector {
     message_id: Uuid,
     next_seq: u64,
-    text_opened: bool,
+    /// Index of the primary text part once opened (lazily on first `Chunk`).
+    text_part: Option<usize>,
+    /// Next part index to assign — both `Chunk` (text part) and `Part` events
+    /// draw from this so part numbers stay gap-free and in arrival order.
+    next_part: usize,
 }
 
 impl Default for DeltaProjector {
@@ -187,7 +227,8 @@ impl DeltaProjector {
         Self {
             message_id: Uuid::nil(),
             next_seq: 0,
-            text_opened: false,
+            text_part: None,
+            next_part: 0,
         }
     }
 
@@ -211,57 +252,94 @@ impl DeltaProjector {
             }
             StreamingEvent::Chunk(c) => {
                 let mut out = Vec::new();
-                if !self.text_opened {
-                    self.text_opened = true;
-                    out.push(WireStreamEvent::PartAdd {
-                        message_id: self.message_id,
-                        seq: self.take_seq(),
-                        op: DeltaOp::Add,
-                        path: TEXT_PART_PATH.to_owned(),
-                        value: json!({ "type": "text", "content": { "text": "" }, "number": 0 }),
-                    });
-                }
+                let idx = match self.text_part {
+                    Some(i) => i,
+                    None => {
+                        let i = self.next_part;
+                        self.next_part += 1;
+                        self.text_part = Some(i);
+                        out.push(WireStreamEvent::PartAdd {
+                            message_id: self.message_id,
+                            seq: self.take_seq(),
+                            op: DeltaOp::Add,
+                            path: format!("parts/{i}"),
+                            value: json!({ "type": "text", "content": { "text": "" }, "number": i }),
+                        });
+                        i
+                    }
+                };
                 out.push(WireStreamEvent::TextDelta {
                     message_id: self.message_id,
                     seq: self.take_seq(),
                     op: DeltaOp::Append,
-                    path: TEXT_BODY_PATH.to_owned(),
+                    path: format!("parts/{idx}/content/text"),
                     value: JsonValue::String(c.chunk),
                 });
                 out
             }
+            StreamingEvent::Status(s) => {
+                vec![WireStreamEvent::StatusChanged {
+                    message_id: self.message_id,
+                    seq: self.take_seq(),
+                    code: s.code,
+                    detail: s.detail,
+                }]
+            }
+            StreamingEvent::Part(p) => {
+                let idx = self.next_part;
+                self.next_part += 1;
+                // Stamp the document `number` so the client places the part.
+                let mut value = serde_json::to_value(&p.part).unwrap_or(JsonValue::Null);
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("number".to_owned(), JsonValue::from(idx));
+                }
+                vec![WireStreamEvent::PartAdd {
+                    message_id: self.message_id,
+                    seq: self.take_seq(),
+                    op: DeltaOp::Add,
+                    path: format!("parts/{idx}"),
+                    value,
+                }]
+            }
+            StreamingEvent::Citation(c) => {
+                self.citation_deltas(
+                    c.part_number,
+                    &c.file_citations,
+                    &c.link_citations,
+                    &c.references,
+                )
+            }
+            StreamingEvent::State(s) => {
+                vec![WireStreamEvent::StateChanged {
+                    message_id: self.message_id,
+                    seq: self.take_seq(),
+                    state: s.state,
+                }]
+            }
+            StreamingEvent::SessionMeta(s) => {
+                vec![WireStreamEvent::SessionMetaUpdated {
+                    message_id: self.message_id,
+                    seq: self.take_seq(),
+                    patch: s.patch,
+                }]
+            }
+            StreamingEvent::Tool(t) => {
+                vec![WireStreamEvent::Tool {
+                    message_id: self.message_id,
+                    seq: self.take_seq(),
+                    tool: t.tool,
+                    payload: t.payload,
+                }]
+            }
             StreamingEvent::Complete(c) => {
-                let mut out = Vec::new();
-                if !c.file_citations.is_empty() {
-                    let value = serde_json::to_value(&c.file_citations).unwrap_or(JsonValue::Null);
-                    out.push(WireStreamEvent::FileCitationAdd {
-                        message_id: self.message_id,
-                        seq: self.take_seq(),
-                        op: DeltaOp::Append,
-                        path: "parts/0/file_citations".to_owned(),
-                        value,
-                    });
-                }
-                if !c.link_citations.is_empty() {
-                    let value = serde_json::to_value(&c.link_citations).unwrap_or(JsonValue::Null);
-                    out.push(WireStreamEvent::LinkCitationAdd {
-                        message_id: self.message_id,
-                        seq: self.take_seq(),
-                        op: DeltaOp::Append,
-                        path: "parts/0/link_citations".to_owned(),
-                        value,
-                    });
-                }
-                if !c.references.is_empty() {
-                    let value = serde_json::to_value(&c.references).unwrap_or(JsonValue::Null);
-                    out.push(WireStreamEvent::ReferenceAdd {
-                        message_id: self.message_id,
-                        seq: self.take_seq(),
-                        op: DeltaOp::Append,
-                        path: "parts/0/references".to_owned(),
-                        value,
-                    });
-                }
+                // Batch citations (FR-023) attach to the primary text part.
+                let tp = i32::try_from(self.text_part.unwrap_or(0)).unwrap_or(0);
+                let mut out = self.citation_deltas(
+                    tp,
+                    &c.file_citations,
+                    &c.link_citations,
+                    &c.references,
+                );
                 out.push(WireStreamEvent::Complete {
                     message_id: self.message_id,
                     seq: self.take_seq(),
@@ -277,6 +355,49 @@ impl DeltaProjector {
                 }]
             }
         }
+    }
+
+    /// Project citation/reference lists targeting `part_number` into the
+    /// matching typed wire events (one per non-empty list).
+    fn citation_deltas(
+        &mut self,
+        part_number: i32,
+        file_citations: &[chat_engine_sdk::models::FileCitation],
+        link_citations: &[chat_engine_sdk::models::LinkCitation],
+        references: &[chat_engine_sdk::models::LinkReference],
+    ) -> Vec<WireStreamEvent> {
+        let mut out = Vec::new();
+        if !file_citations.is_empty() {
+            let value = serde_json::to_value(file_citations).unwrap_or(JsonValue::Null);
+            out.push(WireStreamEvent::FileCitationAdd {
+                message_id: self.message_id,
+                seq: self.take_seq(),
+                op: DeltaOp::Append,
+                path: format!("parts/{part_number}/file_citations"),
+                value,
+            });
+        }
+        if !link_citations.is_empty() {
+            let value = serde_json::to_value(link_citations).unwrap_or(JsonValue::Null);
+            out.push(WireStreamEvent::LinkCitationAdd {
+                message_id: self.message_id,
+                seq: self.take_seq(),
+                op: DeltaOp::Append,
+                path: format!("parts/{part_number}/link_citations"),
+                value,
+            });
+        }
+        if !references.is_empty() {
+            let value = serde_json::to_value(references).unwrap_or(JsonValue::Null);
+            out.push(WireStreamEvent::ReferenceAdd {
+                message_id: self.message_id,
+                seq: self.take_seq(),
+                op: DeltaOp::Append,
+                path: format!("parts/{part_number}/references"),
+                value,
+            });
+        }
+        out
     }
 }
 
@@ -406,5 +527,103 @@ mod tests {
             WireStreamEvent::Error { message_id: mid(), seq: 1, error: "x".into() }.is_terminal()
         );
         assert!(!WireStreamEvent::Start { message_id: mid(), seq: 0 }.is_terminal());
+    }
+
+    #[test]
+    fn status_projects_transient_typed_event() {
+        use chat_engine_sdk::models::StreamingStatusEvent;
+        let mut p = DeltaProjector::new();
+        let _ = p.project(StreamingEvent::Start(StreamingStartEvent { message_id: mid() }));
+        let out = p.project(StreamingEvent::Status(StreamingStatusEvent {
+            message_id: mid(),
+            code: "thinking".into(),
+            detail: Some("reading docs".into()),
+        }));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].event_name(), "message.status.changed");
+        let v = serde_json::to_value(&out[0]).unwrap();
+        assert_eq!(v["type"], "message.status.changed");
+        assert_eq!(v["code"], "thinking");
+        assert!(!out[0].is_terminal());
+    }
+
+    #[test]
+    fn part_events_open_gap_free_indexed_parts() {
+        use chat_engine_sdk::models::{MessagePartInput, MessagePartType, StreamingPartEvent};
+        let mut p = DeltaProjector::new();
+        let _ = p.project(StreamingEvent::Start(StreamingStartEvent { message_id: mid() }));
+        // A text chunk claims parts/0.
+        let _ = p.project(StreamingEvent::Chunk(StreamingChunkEvent {
+            message_id: mid(),
+            chunk: "hi".into(),
+        }));
+        // A Part event claims parts/1.
+        let out = p.project(StreamingEvent::Part(StreamingPartEvent {
+            message_id: mid(),
+            part: MessagePartInput {
+                part_type: MessagePartType::Links,
+                content: json!({ "links": [{ "url": "https://x" }] }),
+                file_citations: vec![],
+                link_citations: vec![],
+                references: vec![],
+            },
+        }));
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            &out[0],
+            WireStreamEvent::PartAdd { op: DeltaOp::Add, path, .. } if path == "parts/1"
+        ));
+        let v = serde_json::to_value(&out[0]).unwrap();
+        assert_eq!(v["type"], "message.part.add");
+        assert_eq!(v["value"]["number"], 1);
+    }
+
+    #[test]
+    fn mid_stream_citation_targets_named_part() {
+        use chat_engine_sdk::models::StreamingCitationEvent;
+        let cite: chat_engine_sdk::models::FileCitation = serde_json::from_value(json!({
+            "document_id": "doc-1", "document_name": "Doc", "index": 1
+        }))
+        .unwrap();
+        let mut p = DeltaProjector::new();
+        let _ = p.project(StreamingEvent::Start(StreamingStartEvent { message_id: mid() }));
+        let out = p.project(StreamingEvent::Citation(StreamingCitationEvent {
+            message_id: mid(),
+            part_number: 2,
+            file_citations: vec![cite],
+            link_citations: vec![],
+            references: vec![],
+        }));
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            &out[0],
+            WireStreamEvent::FileCitationAdd { path, .. } if path == "parts/2/file_citations"
+        ));
+    }
+
+    #[test]
+    fn state_session_meta_and_tool_project_typed_events() {
+        use chat_engine_sdk::models::{
+            StreamingSessionMetaEvent, StreamingStateEvent, StreamingToolEvent,
+        };
+        let mut p = DeltaProjector::new();
+        let _ = p.project(StreamingEvent::Start(StreamingStartEvent { message_id: mid() }));
+        let st = p.project(StreamingEvent::State(StreamingStateEvent {
+            message_id: mid(),
+            state: json!({ "phase": "draft" }),
+        }));
+        let sm = p.project(StreamingEvent::SessionMeta(StreamingSessionMetaEvent {
+            message_id: mid(),
+            patch: json!({ "title": "Renamed" }),
+        }));
+        let tl = p.project(StreamingEvent::Tool(StreamingToolEvent {
+            message_id: mid(),
+            tool: "file_search".into(),
+            payload: json!({ "query": "q" }),
+        }));
+        assert_eq!(st[0].event_name(), "message.state.changed");
+        assert_eq!(sm[0].event_name(), "session.meta.updated");
+        assert_eq!(tl[0].event_name(), "message.tool");
+        assert_eq!(serde_json::to_value(&tl[0]).unwrap()["tool"], "file_search");
     }
 }

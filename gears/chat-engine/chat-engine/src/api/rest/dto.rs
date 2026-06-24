@@ -605,8 +605,7 @@ impl toolkit::api::api_dto::ResponseApiDto for StreamingEventDto {}
 // ---------------------------------------------------------------------------
 
 use crate::domain::message::{
-    StreamingChunkEvent, StreamingCompleteEvent, StreamingErrorEvent, StreamingEvent,
-    StreamingStartEvent,
+    StreamingChunkEvent, StreamingCompleteEvent, StreamingErrorEvent, StreamingStartEvent,
 };
 
 impl From<StreamingStartEvent> for StreamingStartDto {
@@ -640,17 +639,6 @@ impl From<StreamingErrorEvent> for StreamingErrorDto {
         Self {
             message_id: e.message_id,
             error: e.error,
-        }
-    }
-}
-
-impl From<StreamingEvent> for StreamingEventDto {
-    fn from(e: StreamingEvent) -> Self {
-        match e {
-            StreamingEvent::Start(v) => Self::Start(v.into()),
-            StreamingEvent::Chunk(v) => Self::Chunk(v.into()),
-            StreamingEvent::Complete(v) => Self::Complete(v.into()),
-            StreamingEvent::Error(v) => Self::Error(v.into()),
         }
     }
 }

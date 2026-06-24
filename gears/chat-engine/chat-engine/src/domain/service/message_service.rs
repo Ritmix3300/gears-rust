@@ -691,6 +691,10 @@ impl MessageService {
                         source: None,
                     });
                 }
+                // Internal context-overflow summary is text-only; richer events
+                // (status/part/citation/state/session-meta/tool) are irrelevant
+                // to summary persistence and are ignored here.
+                Ok(_) => {}
                 Err(err) => {
                     return Err(err.into());
                 }
@@ -1336,6 +1340,20 @@ impl MessageService {
                                 // driver keeps consuming + buffering so a
                                 // reconnect resumes the full response.
                                 emitter.emit(evt).await;
+                            }
+                            Ok(
+                                ev @ (StreamingEvent::Status(_)
+                                | StreamingEvent::Part(_)
+                                | StreamingEvent::Citation(_)
+                                | StreamingEvent::State(_)
+                                | StreamingEvent::SessionMeta(_)
+                                | StreamingEvent::Tool(_)),
+                            ) => {
+                                // Vocabulary events (FR-024): projected to typed
+                                // wire events, streamed + buffered for resume.
+                                // Persisting parts / message metadata / session
+                                // metadata from these lands in Phase B.
+                                emitter.emit(ev).await;
                             }
                             Ok(StreamingEvent::Complete(c)) => {
                                 last_metadata = c.metadata.clone();
@@ -2077,6 +2095,7 @@ mod tests {
                 StreamingEvent::Chunk(_) => kinds.push("chunk"),
                 StreamingEvent::Complete(_) => kinds.push("complete"),
                 StreamingEvent::Error(_) => kinds.push("error"),
+                _ => kinds.push("other"),
             }
         }
         assert_eq!(kinds, vec!["start", "chunk", "chunk", "complete"]);

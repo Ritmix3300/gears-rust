@@ -425,7 +425,7 @@ async fn it_streaming_cancel_persists_partial_message() {
             StreamingEvent::Complete(_) => {
                 is_complete = true;
             }
-            StreamingEvent::Start(_) | StreamingEvent::Error(_) => {}
+            _ => {}
         }
         if cancel.is_cancelled() {
             // Driver mirrors ADR-0008: stop reading once parent cancels.
@@ -583,6 +583,7 @@ async fn it_stream_from_events_replays_in_order() {
             StreamingEvent::Chunk(_) => got.push("chunk"),
             StreamingEvent::Complete(_) => got.push("complete"),
             StreamingEvent::Error(_) => got.push("error"),
+            _ => got.push("other"),
         }
     }
     assert_eq!(got, vec!["start", "chunk", "complete"]);

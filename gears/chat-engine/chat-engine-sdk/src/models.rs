@@ -749,8 +749,24 @@ pub enum HealthStatus {
 pub enum StreamingEvent {
     /// Marks the beginning of an assistant message's stream.
     Start(StreamingStartEvent),
-    /// A partial content chunk; multiple `Chunk`s concatenate to the full text.
+    /// A partial text content chunk; multiple `Chunk`s concatenate to the full
+    /// text of the assistant's primary `text` part.
     Chunk(StreamingChunkEvent),
+    /// Transient progress indicator (e.g. `thinking`, `analyzing`). Streamed to
+    /// the client but **not** persisted with the message.
+    Status(StreamingStatusEvent),
+    /// Emits a complete typed message part (image/video/link/code/…) to append
+    /// to the message document. Persisted with the message on finalize.
+    Part(StreamingPartEvent),
+    /// Mid-stream citations/references attached to a part (vs. the batch set on
+    /// `Complete`). Persisted with that part on finalize.
+    Citation(StreamingCitationEvent),
+    /// Opaque assistant-message state patch; merged into the message metadata.
+    State(StreamingStateEvent),
+    /// Session-scoped metadata patch; merged into the owning session's metadata.
+    SessionMeta(StreamingSessionMetaEvent),
+    /// Tool-invocation trace (e.g. file search); recorded in message metadata.
+    Tool(StreamingToolEvent),
     /// Stream completed successfully; may carry final metadata.
     Complete(StreamingCompleteEvent),
     /// Stream terminated with an error; no more events follow.
@@ -805,6 +821,89 @@ pub struct StreamingErrorEvent {
     pub message_id: Uuid,
     /// Human-readable error description (may include plugin error code).
     pub error: String,
+}
+
+/// Transient progress indicator (`StreamingEvent::Status`). Streamed to the
+/// client for live feedback but not persisted with the finalized message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StreamingStatusEvent {
+    /// ID of the assistant message this status pertains to.
+    pub message_id: Uuid,
+    /// Machine-readable status code (e.g. `thinking`, `analyzing`, `searching`).
+    pub code: String,
+    /// Optional human-readable detail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Emits a complete typed message part mid-stream (`StreamingEvent::Part`):
+/// images, videos, links, code, or an additional text part. The part is
+/// appended to the message document and persisted on finalize.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StreamingPartEvent {
+    /// ID of the assistant message this part belongs to.
+    pub message_id: Uuid,
+    /// The typed part to append (type + content + optional citations).
+    pub part: MessagePartInput,
+}
+
+/// Mid-stream citations/references attached to a part
+/// (`StreamingEvent::Citation`). Unlike the batch set carried on `Complete`,
+/// these arrive incrementally; they target the part at `part_number`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StreamingCitationEvent {
+    /// ID of the assistant message these citations belong to.
+    pub message_id: Uuid,
+    /// Target part index (defaults to the primary text part, `0`).
+    #[serde(default)]
+    pub part_number: i32,
+    /// Document citations to append to the target part.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_citations: Vec<FileCitation>,
+    /// Web-page citations to append to the target part.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub link_citations: Vec<LinkCitation>,
+    /// URL references to append to the target part.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<LinkReference>,
+}
+
+/// Opaque assistant-message state patch (`StreamingEvent::State`); merged into
+/// the finalized message's metadata under `state`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StreamingStateEvent {
+    /// ID of the assistant message whose state changed.
+    pub message_id: Uuid,
+    /// Arbitrary state object the client maintains alongside the document.
+    pub state: serde_json::Value,
+}
+
+/// Session-scoped metadata patch (`StreamingEvent::SessionMeta`); shallow-merged
+/// into the owning session's `metadata` while the message streams.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StreamingSessionMetaEvent {
+    /// ID of the assistant message that triggered the session update.
+    pub message_id: Uuid,
+    /// Partial session metadata to shallow-merge into `session.metadata`.
+    pub patch: serde_json::Value,
+}
+
+/// Tool-invocation trace (`StreamingEvent::Tool`), e.g. a file search the
+/// plugin ran; appended to the finalized message's metadata under `tools`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct StreamingToolEvent {
+    /// ID of the assistant message this tool call belongs to.
+    pub message_id: Uuid,
+    /// Tool identifier (e.g. `file_search`).
+    pub tool: String,
+    /// Tool-specific payload (query, results, status).
+    pub payload: serde_json::Value,
 }
 
 #[cfg(test)]

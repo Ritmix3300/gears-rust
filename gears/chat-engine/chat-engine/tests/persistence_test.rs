@@ -151,6 +151,7 @@ async fn cancel_after_partial_chunks_persists_is_complete_false_against_sqlite()
             StreamingEvent::Complete(_) | StreamingEvent::Error(_) => {
                 panic!("driver should not have produced Complete/Error before cancel")
             }
+            _ => {}
         }
     }
     assert!(start_seen, "driver must emit Start before any chunk");

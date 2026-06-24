@@ -849,6 +849,11 @@ impl IntelligenceService {
                                 errored = Some(e.error);
                                 break;
                             }
+                            // Summary streams are text-only; richer vocabulary
+                            // events (status/part/citation/state/session-meta/
+                            // tool) are not produced by `on_session_summary`
+                            // and are ignored if a plugin emits them.
+                            Ok(_) => {}
                             Err(err) => {
                                 let s = err.to_string();
                                 let evt = StreamingEvent::Error(StreamingErrorEvent {
@@ -2007,6 +2012,7 @@ mod tests {
                 StreamingEvent::Chunk(_) => kinds.push("chunk"),
                 StreamingEvent::Complete(_) => kinds.push("complete"),
                 StreamingEvent::Error(_) => kinds.push("error"),
+                _ => kinds.push("other"),
             }
         }
         assert_eq!(kinds, vec!["start", "chunk", "chunk", "complete"]);
@@ -2069,6 +2075,7 @@ mod tests {
                 StreamingEvent::Chunk(_) => kinds.push("chunk"),
                 StreamingEvent::Complete(_) => kinds.push("complete"),
                 StreamingEvent::Error(_) => kinds.push("error"),
+                _ => kinds.push("other"),
             }
         }
         assert_eq!(kinds, vec!["start", "chunk", "error"]);
