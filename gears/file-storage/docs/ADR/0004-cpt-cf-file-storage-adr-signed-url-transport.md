@@ -76,7 +76,11 @@ liability that would couple intermediaries to a layout we want free to change.
   (`kid`) for P2 rotation.
 * **Transport = both query and header**, chosen by access intent; the **token bytes are identical** either way:
   * **query** — `?fs-token=<token>` — for bare, embeddable URLs (browser, `<img>`/`<video>`, `curl`, media `Range`; the caller
-    cannot set headers);
+    cannot set headers). Because a query token can leak via server/proxy logs, browser history, and the `Referer`
+    header, and P1 has **no per-token revocation**, query-token URLs **MUST** be issued with a **very short TTL**
+    (the short `default_url_ttl`, minutes — see DESIGN §4.5); they are for immediate fetch/embed, not durable links.
+    Long-lived, shareable, or anonymous links are explicitly **out of P1** and belong to the future **FileShare/P3**
+    surface, which will own its own revocation, expiry, and download-count semantics;
   * **header** — `X-FS-Token: <token>` — for programmatic / SDK / batch callers: keeps the credential out of the URL
     (clean logs / no `Referer` leak) and the **URL stable** across re-issue (clean CDN cache). (The token is **never**
     carried in `Authorization` — that header always carries the standard platform JWT.)
@@ -97,6 +101,16 @@ the dual-envelope (query + header) and the asymmetric, sidecar-cannot-mint prope
   (sidecar)**; all claims live inside the token.
 * **New dependency:** a PASETO v4 library — control plane signs (`v4.public`), sidecar verifies. Ed25519 keys as before
   (private → control, public → sidecar); `kid` in the footer; rotation is P2.
+* **FIPS posture (must be settled before implementation).** PASETO `v4.public` uses **Ed25519**, which *is* approved
+  under **FIPS 186-5**, but approval requires the signing/verifying primitive to run inside a **FIPS-validated
+  cryptographic module** — a generic PASETO/Ed25519 crate is not automatically compliant. Plan: in FIPS deployments
+  the token signer/verifier MUST be backed by a FIPS-validated provider (the platform already ships
+  `rustls-corecrypto-provider`); the chosen PASETO/Ed25519 implementation must route through it or be replaced by one
+  that does. Because the token is **opaque and the codec is freely evolvable** (Token Opacity Contract), a
+  **fallback** to a FIPS-approved alternative (e.g. ECDSA P-256 / a JWS profile over the validated module) is
+  available without changing the rest of the design. The concrete crate + provider choice (and the non-FIPS default)
+  is an implementation-time decision gated on confirming the deployment's FIPS requirement; it does **not** alter the
+  control-signs / sidecar-verifies / sidecar-cannot-mint property.
 * **Observability/debuggability** is **sanitized server-side structured logging** by control/sidecar (tenant/file ids,
   outcome; never the token or raw claims). It is **not** done by decoding the token at the edge.
 * **Embeddable vs. leak vs. cache:** query envelope (token in URL, short `exp`) for embeddable; header envelope (token

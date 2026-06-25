@@ -68,6 +68,12 @@ FileStorage is split into two cooperating planes (see
 - a **data-plane sidecar** that is the only component to move user bytes, is connected to the storage backends, and
   serves content exclusively through those signed URLs.
 
+The sidecar is a deliberate **platform-level exception** to the standard "API Gateway owns REST hosting" model: it is
+**not** an ordinary gear REST route fronted by the API Gateway, but a dedicated byte-moving data plane with its own
+host/URL that clients reach directly via signed URLs. This exception is what lets the data plane scale independently
+and keeps content off the control-plane (gateway) path; how it authenticates and is contracted is specified in
+DESIGN.md §3.3 and §4.5.
+
 Consequently every content operation is at least two requests: a control request to obtain a signed URL, plus one or
 more data requests against the sidecar. Backends are never addressed by clients directly — the signed URL always
 points at the sidecar — so backend opacity, centralized per-byte metering, and uniform audit/policy coverage are

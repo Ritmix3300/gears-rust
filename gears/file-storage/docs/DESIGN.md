@@ -27,6 +27,7 @@
   - [4.5 Signed-URL signature](#45-signed-url-signature)
   - [4.6 Worked example (LMS image upload and display)](#46-worked-example-lms-image-upload-and-display)
   - [4.7 Worked example (multipart upload and resume)](#47-worked-example-multipart-upload-and-resume)
+  - [4.8 P1 implementation notes & decisions](#48-p1-implementation-notes--decisions)
 - [5. Traceability](#5-traceability)
 
 <!-- /toc -->
@@ -512,6 +513,19 @@ present) the platform token, then drives the byte path. The only component clien
 - Own the **best-effort cleanup**: on the `415` magic-bytes abort (or any error after `put()` started), delete the
   partially-written object; a hard crash leaves an orphan swept by the P2 cleanup engine
 
+##### Auth model (exception to gateway-auth)
+
+Because the sidecar is **not** fronted by the API Gateway (it is the data-plane exception, see PRD §1.1), it does
+**not** receive a gateway-derived `SecurityContext`. Authorization for a content request is carried entirely by the
+**signed token** (the delegated authorization artifact, see §4.5): the sidecar verifies the token's signature and
+claims and treats that as the access decision for this resource + operation until `exp` — it performs **no fresh PDP
+call**. A platform **JWT in `Authorization`** is validated **only** when the token carries a token-claim predicate
+(e.g. `sub`/`tenant_id`), in which case the sidecar checks the JWT and matches each predicate; absent a predicate the
+JWT is not required. The sidecar derives no tenant/owner `SecurityContext` of its own beyond what the token asserts.
+Request-id propagation and rate-limiting are the sidecar's own responsibility (it is not behind the gateway): it
+honours/propagates `X-Request-Id` and applies its own per-instance connection/bandwidth limits (the per-URL
+`max_rate`/`max_conns` claims are **P2**, see §4.5).
+
 ##### Responsibility boundaries
 
 Makes no authorization *decision* — it enforces the decision already encoded in the signed URL and the token
@@ -778,6 +792,12 @@ schema, status codes — is documented in **[api.md](./api.md)**. The summary:
 - **Sidecar content surface**: `PUT`/`GET`/`HEAD` (+ multipart `part` in P2) addressed **only** by a control-issued
   signed URL on the sidecar's own domain. Raw body — **no `multipart/form-data`**; the declared mime travels in the
   pre-register context, not a form part
+- **Sidecar contract documentation**: unlike control routes (auto-described via OperationBuilder → generated
+  OpenAPI), the sidecar's `PUT`/`GET`/`HEAD` surface is **outside** the generated OpenAPI flow. Clients do not call
+  it from a hand-written URL — they always receive a ready, opaque signed URL from the control plane and issue the
+  HTTP verb the control response prescribes. Its byte-level contract (raw body, `Range`/conditional semantics,
+  echoed response headers, status codes) is specified normatively in **[api.md](./api.md)**; publishing it as a
+  separate OpenAPI document (or `HEAD`-discoverable capabilities) is deferred to P2
 - **No `?replace_content` flag**: content replacement is structural — a new version is uploaded and **bound** under
   CAS, never an in-place mutation of an existing object — so the old "explicit replace intent" flag is gone
 - **Conditional headers**: `If-Match` required on **bind** and `DELETE`; `If-Match`/`If-None-Match` optional on reads
@@ -1112,7 +1132,8 @@ and is immutable.
 
 **Indexes**:
 - unique partial index on `(file_id) WHERE is_current` — at most one current version per file
-- partial index on `(file_id) WHERE status = 'pending'` — supports cleanup of abandoned pre-registered versions (P2)
+- partial index on `(created_at) WHERE status = 'pending'` — supports time-ordered cleanup of abandoned
+  pre-registered versions (P2); matches `file_versions_pending_idx` in migration.sql
 
 **Constraints**: `backend_id`/`backend_path` immutable per version (a content write makes a **new** version; the P2
 `backend-migrator` may relocate a version's bytes after a verified copy). The ETag is derived from
@@ -1388,9 +1409,17 @@ everything else is optional.
 | Max rate | `max_rate` (bytes/s) | no | **P2** | up/down | throttled to ≤ rate |
 | Max connections | `max_conns` | no | **P2** | up/down | `429` |
 
-- **`exp` is mandatory and capped.** It MUST NOT be further out than the configured `max_url_ttl` (recommended **7
-  days**); the cap is enforced by the **control plane at signing** (it refuses to mint a longer token). The sidecar
-  rejects when `now > exp`. "Available to everyone for 5 minutes" = only `exp`, no token-claim predicate.
+- **`exp` is mandatory, short by default, and hard-capped.** Two distinct knobs: a **short default issuance TTL**
+  (`default_url_ttl`, recommended **minutes** — e.g. 15 min — applied to every URL the control plane mints unless a
+  caller justifies more) and a **hard ceiling** `max_url_ttl` (≤ **7 days**) that the control plane refuses to
+  exceed at signing. The sidecar rejects when `now > exp`. "Available to everyone for 5 minutes" = only `exp`, no
+  token-claim predicate.
+- **Stale-permission window (accepted trade-off).** Authorization is evaluated by the control plane **at signing**;
+  with no per-token revocation in P1, a token remains valid until `exp` even if the caller's permissions change.
+  The TTL therefore bounds the stale-permission exposure, so the **default is kept short** (minutes) for private
+  content; the 7-day ceiling is an **explicitly accepted** trade-off reserved for low-sensitivity / deliberately
+  long-lived cases, not the norm. Emergency revocation relies on the platform token-revocation path for
+  predicate-bound tokens, and on key rotation (P2) for the signing keypair.
 - **A size claim is optional.** If `max_size` (or `exact_size`) is present, the sidecar **MUST** enforce it (mid-stream
   `413`); if **neither** is present, the sidecar imposes **no FS-level size cap** — only the backend's own default size
   limits apply. `max_size` and `exact_size` are **mutually exclusive** — both present is a contradiction the control
@@ -1401,7 +1430,11 @@ everything else is optional.
   scoped to **a single `(file_id, op)`**; cross-instance coordination across the sidecar fleet (global counter/shaper,
   per-backend sharding, …) is an open P2 design point, deferred to the P2 FEATURE.
 
-**Verification (sidecar).** On each request the sidecar:
+**Verification (sidecar).** The signed token **is** the delegated authorization artifact for exactly one resource +
+operation until `exp`: a valid token *is* the access decision, made by the control plane at signing. The sidecar
+performs **no request-time PDP/AuthZ call** and reads no tenant/owner permission state — so byte access here is not
+"DB/object access without a decision", it is access under a decision the control plane already made and signed. On
+each request the sidecar:
 
 1. extracts the token from the `fs-token` query param **or** the `X-FS-Token` header (never `Authorization` — that is
    the platform JWT), and **verifies the PASETO `v4.public` signature** with its public key (P2: selected by the footer
@@ -1708,6 +1741,42 @@ resumes** without re-uploading what already landed. Same hosts as §4.6. The stu
    re-upload everything. So the session `expires_at` is exactly the knob that bounds how long a half-finished upload
    remains resumable; the short per-part URL `exp` only controls how often the client must re-presign, never whether
    progress is lost.
+
+### 4.8 P1 implementation notes & decisions
+
+The P1 control plane and the data-plane sidecar are implemented under
+`gears/file-storage/` (crates `cf-gears-file-storage-sdk` + `cf-gears-file-storage`, the latter also building the
+`sidecar` binary). The following concrete decisions were taken where this design left a choice; each is consistent
+with the design intent above and is recorded here so the doc matches what ships.
+
+- **Signed-URL codec (§4.5, ADR-0004).** P1 ships an **Ed25519-signed compact token**
+  (`base64url(payload).base64url(signature)`), codec-equivalent to PASETO `v4.public` (control signs with the private
+  key, sidecar verifies with the public key, sidecar can never mint). Because the token is opaque, swapping to a
+  literal PASETO library is a non-breaking change. **FIPS**: Ed25519 is FIPS 186-5 approved but must run inside a
+  FIPS-validated module (`rustls-corecrypto-provider`); a FIPS-approved fallback (ECDSA P-256) is available behind the
+  opaque token — final crate/provider choice is gated on the deployment's FIPS requirement (ADR-0004 "FIPS posture").
+- **Signed-URL TTL (§4.5).** Two knobs: a **short default issuance TTL** (`default_url_ttl`, 15 min in P1) applied to
+  every minted URL to bound the stale-permission window, and a **hard ceiling** `max_url_ttl` (≤ 7 days) the control
+  plane refuses to exceed at signing. The sidecar only checks `now ≤ exp`.
+- **Sidecar ↔ control path (ADR-0003).** P1 path is **s2s REST** (the sidecar calls the control plane via the FS SDK
+  with its app-token + on-behalf-of `<user>`); the sidecar holds **no** direct DB connection. The signed token is the
+  delegated authorization artifact (no request-time PDP at the sidecar). Direct-DB co-location is a deferred P2
+  optimization.
+- **Schema (§3.7).** The gear migration uses **flat (unqualified) table names** on both Postgres and SQLite (a SeaORM
+  entity has a static `table_name`; SQLite has no schemas). The `file_storage` Postgres schema in migration.sql is the
+  canonical/deferred target. `version_id` is the sole entity primary key (the table keeps the composite
+  `(file_id, version_id)` PK); the `is_current` ↔ `files.content_id` invariant is maintained **atomically** by the
+  bind transaction (single transaction: CAS `content_id`, clear old `is_current`, set new), preventing split-brain.
+- **Backends (§3.2, `cpt-cf-file-storage-fr-backend-capabilities`).** P1 ships a `StorageBackend` trait with two
+  backend *types* — a local-filesystem backend (default) and an in-memory backend — plus a capability model and a
+  registry. S3/GCS/etc. and TOML-driven backend configuration are deferred (external SDK + security review).
+- **Authorization (§3.2, `cpt-cf-file-storage-fr-authorization`).** Per-type decisions go through the platform
+  Authorization Service (`PolicyEnforcer` PEP) over `gts.cf.fstorage.file.type.v1~`; tenant-boundary is enforced
+  independently of the PDP (point operations prefetch within the caller's tenant; listing applies the tenant scope).
+- **Listing.** Offset pagination with a mandatory owner filter (PRD allows offset *or* cursor); OData `$filter`/
+  `$orderby` is a deferred enhancement.
+- **Remaining for full P1** (tracked in [PLAN-P1.md §7](./PLAN-P1.md)): wiring the sidecar→control s2s callback
+  end-to-end, a PostgreSQL E2E pass, TOML-driven `backend-config-source`, and the FIPS crate/provider selection.
 
 ## 5. Traceability
 

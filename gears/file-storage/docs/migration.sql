@@ -27,6 +27,22 @@
 --   202xxxxxxxxx_file_storage_p2_versioning.sql
 --   ... etc
 -- This combined file lists the DDL in dependency order within each phase.
+--
+-- Implementation note (P1 gear migration):
+--   * This file is the CANONICAL Postgres schema (the `file_storage` schema is
+--     the production target). The SeaORM migration the gear actually runs
+--     (gears/file-storage/file-storage/src/infra/storage/migrations/) uses
+--     UNQUALIFIED (flat) table names — `files`, `file_versions`,
+--     `files_custom_metadata` — on BOTH Postgres and SQLite, because a SeaORM
+--     entity has a static `table_name` and SQLite has no schemas, so a
+--     per-backend schema qualifier cannot be expressed in the entity. Behaviour
+--     is identical; adopting the `file_storage` schema on Postgres is a deferred,
+--     entity-attribute-only change.
+--   * In the entity layer `version_id` is the SOLE primary key of file_versions
+--     (it is a globally unique uuid), while the table keeps the composite
+--     `(file_id, version_id)` PK below; this keeps version updates/deletes keyed
+--     off a single PK column. The `is_current` <-> `files.content_id` invariant
+--     (see the column comment) is maintained ATOMICALLY by the bind transaction.
 -- =============================================================================
 
 
@@ -124,7 +140,17 @@ CREATE TABLE file_storage.file_versions (
     -- Lifecycle: 'pending' from pre-register until bind, then 'available'.
     status           text         NOT NULL  DEFAULT 'pending'
                                   CHECK (status IN ('pending', 'available')),
-    -- True for the file's current version (matches files.content_id).
+    -- True for the file's current version. This is a denormalization of
+    -- files.content_id, kept deliberately: it backs the unique partial index
+    -- below (cheap "is there a current version" / one-current-per-file
+    -- enforcement) and the version-listing `is_current` flag without a join.
+    -- INVARIANT: is_current = true on exactly the row whose version_id equals
+    -- files.content_id. The bind operation MUST maintain it ATOMICALLY (single
+    -- transaction): swap files.content_id (CAS on If-Match), clear the old
+    -- current (is_current = false), set the new current (is_current = true).
+    -- See cpt-cf-file-storage-fr-upload-file; split-brain (two currents, or a
+    -- current that disagrees with content_id) is prevented by the transaction
+    -- plus the unique partial index, and is covered by bind tests.
     is_current       boolean      NOT NULL  DEFAULT false,
 
     -- Backend pointer (immutable per version). backend_id references the

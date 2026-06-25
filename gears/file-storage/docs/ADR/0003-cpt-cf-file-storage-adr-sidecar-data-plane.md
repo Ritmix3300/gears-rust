@@ -77,9 +77,16 @@ planes:
   code touches bytes is the in-process **SDK proxy mode**, which streams inside the *consumer
   gear's* process — never through the control-plane service.
 * **Data plane** — the **sidecar**. It has its own domain and URL and is the only component that
-  moves user bytes. It is connected to N storage backends, validates platform auth tokens (the
-  standard way) **and** the signed-URL signature, and reaches the control plane through the FS SDK
-  (direct-DB or REST). It is effectively a full FileStorage instance over the shared metadata DB.
+  moves user bytes. It is connected to N storage backends and validates the signed-URL signature
+  (and a platform token only when the signed URL carries a token-claim predicate — see DESIGN §3.2).
+  **P1 path (explicit):** the sidecar reaches the control plane **over the FS SDK in s2s REST mode**
+  (its own app-token plus an on-behalf-of `<user>` claim) to pre-register and bind a version — it
+  holds **no** direct database connection and is a thin, stateless byte-mover. This trades a little
+  per-op latency (an extra control round-trip at pre-register/bind) for a clean security/failure
+  boundary: the data plane never gets DB credentials and cannot mutate metadata except through the
+  control plane's authorized operations. The alternative **direct-DB** mode — the sidecar as a full
+  FileStorage instance over the shared metadata DB (lower latency, no control round-trip) — is
+  **deferred to P2** as a co-located-deployment optimization, behind the same FS SDK interface.
 
 The critical difference from the direct-to-backend model the prior proxy-all design rejected: **the signed URL points
 at our own sidecar, never at the raw backend.** Therefore every property the prior proxy-all design protected is

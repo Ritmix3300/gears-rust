@@ -23,11 +23,25 @@ operation is at least two requests: a control request to obtain a signed URL, th
 
 ## Two planes
 
-- **Control plane** base URL: `/api/file-storage/v1` — JWT enforced by API Gateway; standard owner/tenant
-  authorization applies. **JSON only — no request or response body ever contains file content.**
-- **Sidecar**: its own domain; endpoints are reachable only with a valid control-issued **signed URL** (and, when the
-  URL carries a token-claim predicate, a valid platform JWT). The signed URL always points at the sidecar, never at a
-  backend.
+- **Control plane** base URL: `/api/file-storage/v1` — a normal gear REST surface: **JWT enforced by API Gateway**,
+  standard owner/tenant authorization (PEP) applies, routes auto-described via OperationBuilder → generated OpenAPI.
+  **JSON only — no request or response body ever contains file content.**
+- **Sidecar**: its own domain; reachable only with a valid control-issued **signed URL**. The signed URL always points
+  at the sidecar, never at a backend.
+
+  The sidecar is a deliberate **platform-level exception** to "API Gateway owns REST hosting" — it is **not** fronted
+  by the gateway and does **not** receive a gateway-derived `SecurityContext`. Its authorization model:
+  - the **signed token is the delegated authorization artifact** for exactly one resource + operation until `exp`; a
+    valid token *is* the access decision (made by the control plane at signing). The sidecar performs **no
+    request-time PDP/AuthZ call** and reads no tenant/owner permission state;
+  - a platform **JWT in `Authorization`** is validated by the sidecar **only** when the token carries a `tok.<claim>`
+    predicate (then it matches each claim); absent a predicate, no JWT is required;
+  - request-id propagation and per-instance connection/bandwidth limits are the sidecar's own responsibility (it is
+    not behind the gateway).
+
+  Because clients never hand-write sidecar URLs (they always receive a ready, opaque signed URL from the control
+  plane), the sidecar surface is **outside the generated OpenAPI flow**; its byte-level contract is specified
+  normatively in this document. (A standalone OpenAPI document for the sidecar is deferred to P2.)
 
 Encoding conventions:
 - Control bodies are `application/json`. The sidecar `PUT` body is the **raw** object bytes (no `multipart/form-data`).
@@ -68,8 +82,11 @@ S2. GET    <signed download url>           download content                     
 S3. HEAD   <signed download url>           content headers (full-file)                             — If-None-Match
 ```
 
-The sidecar verifies the PASETO token and its claims (and a platform JWT when a token-claim predicate is present)
-before serving. On `PUT` it pre-registers + binds against the control plane on the user's behalf.
+The sidecar verifies the signed token and its claims (and a platform JWT only when a `tok.<claim>` predicate is
+present) before serving — a valid token is the delegated authorization decision, so there is no request-time PDP
+call. On `PUT` it pre-registers + binds against the control plane **on the user's behalf** via the FS SDK in **s2s
+REST mode** (its own app-token plus an on-behalf-of `<user>` claim) — the P1 sidecar holds **no** direct DB
+connection and is a thin, stateless byte-mover (the direct-DB mode is a P2 co-located optimization; see ADR-0003).
 
 ## P2 — Multipart upload (declared, not implemented in P1)
 
@@ -119,6 +136,14 @@ engine, `cpt-cf-file-storage-fr-orphan-reconciliation`). Clients **should** rebi
   algorithm-confusion). No DB lookup to verify. No per-token revocation — emergency revocation is the platform auth
   module's token revocation. P1 uses one static keypair; a `kid` in the PASETO **footer** selects the key in P2
   (rotation). See [ADR-0004](./ADR/0004-cpt-cf-file-storage-adr-signed-url-transport.md).
+  - **Implementation note (P1):** the shipped P1 codec is an **Ed25519-signed compact token**
+    (`base64url(payload).base64url(signature)`) that is **codec-equivalent** to PASETO `v4.public` — same asymmetric
+    control-signs/sidecar-verifies property and the same opaque, evolvable claim-set. Because the token is opaque
+    (below), the concrete codec is an internal detail of control + sidecar and may move to a literal PASETO library
+    without any client-visible change.
+  - **FIPS posture:** Ed25519 is FIPS 186-5 approved, but a FIPS deployment requires the sign/verify primitive to run
+    inside a FIPS-validated module (the platform's `rustls-corecrypto-provider`); a FIPS-approved fallback (e.g.
+    ECDSA P-256) is available behind the same opaque token. See ADR-0004 "FIPS posture".
 - **Opaque to everyone but control + sidecar.** The token's claim-set and crypto are private to the minter and verifier;
   every other participant (browser, CDN, proxy, app, logs, SDK transport) MUST treat it as **opaque bytes** and never
   parse it — the format can and will change ("Token Opacity Contract").
@@ -138,9 +163,15 @@ engine, `cpt-cf-file-storage-fr-orphan-reconciliation`). Clients **should** rebi
   | `expected_hash` = `<alg>:<hex>` | no | P1 | upload | `422` |
   | `max_rate` | no | P2 | up/down | throttle |
   | `max_conns` | no | P2 | up/down | `429` |
-- **`exp` is mandatory and capped** by `max_url_ttl` (recommended **7 days**), enforced by the control plane at signing
-  (the sidecar checks `now ≤ exp`). A `tok.<claim>` predicate requires a valid platform JWT, which the sidecar validates
-  and matches. "Available to everyone for 5 minutes" = only `exp`.
+- **`exp` is mandatory, short by default, and hard-capped.** Every issued URL gets a **short default TTL**
+  (`default_url_ttl`, minutes — 15 min in P1) to bound the stale-permission window, and the control plane refuses to
+  mint beyond a **hard ceiling** `max_url_ttl` (≤ **7 days**). Both are enforced at signing; the sidecar only checks
+  `now ≤ exp`. **Stale-permission trade-off:** authorization is evaluated at signing and there is no per-token
+  revocation in P1, so the TTL bounds the exposure window — hence the short default for private content; the 7-day
+  ceiling is an explicitly accepted trade-off for low-sensitivity / deliberately long-lived cases (bare query-token
+  URLs in particular MUST use a short TTL; durable/anonymous sharing is P3 FileShare). A `tok.<claim>` predicate
+  requires a valid platform JWT, which the sidecar validates and matches. "Available to everyone for 5 minutes" =
+  only `exp`.
 - **`max_size` and `exact_size` are mutually exclusive** (both → `400` at presign / `403` at the sidecar).
 - **`expected_hash`** `<alg>` must be in the backend allow-list (P1: `SHA-256`); lowercase hex; baked by the control
   plane (may carry a client-supplied value from the presign request).
